@@ -29,14 +29,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 from .config import SETTINGS, Settings
 
 
-class WritesDisabledError(RuntimeError):
+class WritesDisabledError(ToolError):
     """Écriture demandée alors que WP_ENABLE_WRITES n'est pas activé."""
 
 
-class ConfirmationError(RuntimeError):
+class ConfirmationError(ToolError):
     """Jeton inconnu, expiré ou déjà utilisé."""
 
 

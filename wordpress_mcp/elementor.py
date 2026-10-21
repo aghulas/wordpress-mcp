@@ -272,3 +272,59 @@ def is_html_field(path: str) -> bool:
 def dump_elementor_data(elements: list[dict[str, Any]]) -> str:
     """Arbre → chaîne JSON compacte, comme Elementor la stocke."""
     return json.dumps(elements, ensure_ascii=False, separators=(",", ":"))
+
+
+def _esc(text: str) -> str:
+    return _html.escape(text or "", quote=False)
+
+
+def _fallback_for_widget(el: dict[str, Any]) -> str:
+    wt = el.get("widgetType") or ""
+    st = el.get("settings") or {}
+    if wt in DYNAMIC_WIDGETS or wt in ("shortcode", "spacer", "divider", "html", "google_maps", "video"):
+        return ""
+    if wt == "heading":
+        size = str(st.get("header_size") or "h2")
+        size = size if size in {"h1", "h2", "h3", "h4", "h5", "h6"} else "h2"
+        return f"<{size}>{_esc(html_to_text(st.get('title')))}</{size}>" if st.get("title") else ""
+    if wt == "text-editor":
+        return str(st.get("editor") or "")
+    if wt == "image":
+        img = st.get("image") or {}
+        return f'<img src="{_html.escape(str(img.get("url")))}" alt="{_html.escape(str(img.get("alt") or ""))}">' \
+            if isinstance(img, dict) and img.get("url") else ""
+    if wt == "button":
+        url = _link_url(st.get("link"))
+        text = _esc(html_to_text(st.get("text")))
+        return (f'<p><a href="{_html.escape(url)}">{text}</a></p>' if url else f"<p>{text}</p>") if text else ""
+    parts: list[str] = []
+    fields = _settings_text(st)
+    for key, val in fields.items():
+        if key in LINK_KEYS or key == "image":
+            continue
+        if isinstance(val, list):
+            items = []
+            for row in val:
+                label = " — ".join(str(v) for k, v in row.items() if isinstance(v, str) and k not in LINK_KEYS)
+                if label:
+                    items.append(f"<li>{_esc(label)}</li>")
+            if items:
+                parts.append("<ul>" + "".join(items) + "</ul>")
+        elif isinstance(val, str):
+            parts.append(f"<p>{_esc(val)}</p>")
+    return "\n".join(parts)
+
+
+def build_fallback_html(raw: Any) -> str:
+    """Texte de secours d'une page Elementor (champ `content` : recherche, flux RSS, résumé de
+    partage), reconstruit widget par widget dans l'ordre d'affichage — l'équivalent de ce
+    qu'Elementor enregistre quand on clique « Mettre à jour ». Les widgets calculés (articles,
+    shortcodes) sont ignorés."""
+    blocks = []
+    for el, _ in walk(parse_elementor_data(raw)):
+        if el.get("elType") == "widget":
+            html_block = _fallback_for_widget(el).strip()
+            if html_block:
+                blocks.append(html_block)
+    return "\n".join(blocks)
+

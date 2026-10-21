@@ -149,20 +149,21 @@ async def test_expired_token(monkeypatch, tmp_path):
 class FakePage:
     """Page 10 dont le contenu Elementor évolue au fil des POST (relecture après écriture)."""
 
-    def __init__(self, raw=ELEMENTOR_DATA, content="<p>Premier paragraphe.</p><p>Second&nbsp;paragraphe.</p>"):
-        self.raw, self.content, self.n = raw, content, 0
+    def __init__(self, raw=ELEMENTOR_DATA, content="<p>Premier paragraphe.</p><p>Second&nbsp;paragraphe.</p>",
+                 builder=False):
+        self.raw, self.content, self.n, self.builder = raw, content, 0, builder
 
     def json(self):
         return {"id": 10, "status": "publish", "link": f"{BASE}/accueil/", "title": {"raw": "Accueil"},
                 "modified": f"2026-10-21T10:00:0{self.n}", "content": {"raw": self.content},
-                "meta": {"_elementor_data": self.raw}}
+                "meta": {"_elementor_data": self.raw, "_elementor_edit_mode": "builder" if self.builder else ""}}
 
     def get(self, request):
         return httpx.Response(200, json=self.json())
 
     def post(self, request):
         body = json.loads(request.content)
-        self.raw = body["meta"]["_elementor_data"]
+        self.raw = (body.get("meta") or {}).get("_elementor_data", self.raw)
         self.content = body.get("content", self.content)
         self.n += 1
         return httpx.Response(200, json=self.json())
@@ -442,3 +443,62 @@ async def test_media_alt_batch(writes_on):
     out = await WT.wp_ecriture_confirmer(prep["jeton"])
     assert json.loads(post.calls.last.request.content) == {"alt_text": "Élèves à la kermesse"}
     assert out["images"] == [{"id": 55, "texte_alternatif": "Élèves à la kermesse"}]
+
+
+# ------------------------------------------------------------------ v0.4
+async def test_errors_reach_the_model_through_mcp(writes_off):
+    from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+    with pytest.raises(ToolError) as e:
+        await S.mcp.call_tool("wp_page_preparer", {"id": 734, "statut": "draft"})
+    assert not isinstance(e.value, UnexpectedToolError)
+    assert "WP_ENABLE_WRITES" in str(e.value)                  # le message n'est plus masqué
+
+
+@respx.mock
+async def test_wordpress_error_message_visible(writes_on):
+    from mcp.server.mcpserver.exceptions import UnexpectedToolError
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=FakePage().get)
+    with pytest.raises(Exception) as e:
+        await S.mcp.call_tool("wp_widget_texte_preparer", {"id": 10, "widget_id": "zz", "champ": "title",
+                                                            "nouveau_texte": "x"})
+    assert not isinstance(e.value, UnexpectedToolError) and "widget zz introuvable" in str(e.value)
+
+
+@respx.mock
+async def test_regenerate_fallback_like_elementor_update(writes_on):
+    from wordpress_mcp import elementor as E
+    page = FakePage(content="<p>Vieux texte : 2 classe de PS</p>", builder=True)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.get)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.post)
+    cache = respx.delete(f"{BASE}/wp-json/elementor/v1/cache").mock(return_value=httpx.Response(200, json=True))
+    prep = await WT.wp_page_regenerer_preparer(10)
+    assert "2 classe de PS" in prep["apercu"]["texte_de_secours_avant"]
+    assert prep["apercu"]["resume_de_partage_apres"].startswith("Bienvenue à l'école")
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert json.loads(post.calls.last.request.content) == {"content": E.build_fallback_html(ELEMENTOR_DATA)}
+    assert page.raw == ELEMENTOR_DATA and cache.called and out["sauvegarde"].startswith("pages-10-")
+    assert WT._get_gate().load_backup(out["sauvegarde"])["content_raw"] == "<p>Vieux texte : 2 classe de PS</p>"
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_page_regenerer_preparer(10)
+    assert e.value.code == "aucun_changement"
+
+
+@respx.mock
+async def test_regenerate_refused_when_not_elementor(writes_on):
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=FakePage(builder=False).get)
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_page_regenerer_preparer(10)
+    assert e.value.code == "pas_elementor"
+
+
+@respx.mock
+async def test_widget_edit_regenerates_fallback_when_needed(writes_on):
+    from wordpress_mcp import elementor as E
+    page = FakePage(content="<p>texte de secours sans la liste</p>", builder=True)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.get)
+    respx.post(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.post)
+    respx.delete(f"{BASE}/wp-json/elementor/v1/cache").mock(return_value=httpx.Response(200, json=True))
+    prep = await WT.wp_widget_texte_preparer(10, "w4", "icon_list.1.text", "Élémentaire (CP-CM2)")
+    assert any("régénéré" in w for w in prep["avertissements"])
+    await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert page.content == E.build_fallback_html(page.raw) and "Élémentaire (CP-CM2)" in page.content

@@ -25,6 +25,7 @@ import re
 from typing import Any
 
 import httpx
+from mcp.server.mcpserver.exceptions import ToolError
 
 from .config import SETTINGS, Settings
 
@@ -66,8 +67,9 @@ ALLOWED_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-class WordPressError(Exception):
-    """Erreur renvoyée par WordPress (code + message) ou refus du garde-fou."""
+class WordPressError(ToolError):
+    """Erreur renvoyée par WordPress (code + message) ou refus du garde-fou. Hérite de ToolError :
+    le serveur MCP transmet alors le message au modèle (les autres exceptions sont masquées)."""
 
     def __init__(self, message: str, code: str | None = None, status: int | None = None):
         super().__init__(message)
@@ -133,7 +135,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.3",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.4",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -273,7 +275,7 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.3"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.4"}) as http:
             resp = await http.get(url)
         if resp.status_code >= 400:
             raise WordPressError(f"HTTP {resp.status_code}", status=resp.status_code)

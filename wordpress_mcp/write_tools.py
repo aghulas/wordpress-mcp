@@ -1,7 +1,7 @@
 """Outils d'écriture (v2) : préparer → aperçu → confirmer. Voir writes.py pour les verrous.
 
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
-wp_page_preparer, wp_menu_entree_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
+wp_page_preparer, wp_page_regenerer_preparer, wp_menu_entree_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
 
@@ -213,6 +213,11 @@ async def _read_elementor(client: WordPressClient, path: str) -> tuple[dict[str,
     return item, raw, tree
 
 
+def _is_builder(item: dict[str, Any]) -> bool:
+    """Page affichée par Elementor (le champ `content` n'est alors qu'un texte de secours)."""
+    return (item.get("meta") or {}).get("_elementor_edit_mode") == "builder"
+
+
 def _guard_of(item: dict[str, Any], raw: str) -> dict[str, Any]:
     return {"modified": item.get("modified"), "elementor": fingerprint(raw)}
 
@@ -298,7 +303,11 @@ async def wp_widget_texte_preparer(id: int, widget_id: str, champ: str, nouveau_
     if item.get("status") == "publish":
         warnings.append("Contenu publié : le nouveau texte sera VISIBLE IMMÉDIATEMENT après confirmation "
                         "(l'ancien contenu est sauvegardé avant).")
-    if new_content is None:
+    if new_content is None and _is_builder(item):
+        new_content = E.build_fallback_html(new_raw)
+        warnings.append("Le texte de secours (recherche, flux RSS, résumé de partage) sera régénéré à partir du "
+                        "contenu Elementor, comme avec « Mettre à jour » dans Elementor.")
+    elif new_content is None:
         warnings.append("Le texte de secours de la page (recherche, flux RSS) ne sera mis à jour qu'au prochain "
                         "enregistrement dans Elementor.")
     preview = {"contenu": f"{type_contenu} {id} « {_raw(item.get('title'))} »", "lien": item.get("link"),
@@ -545,6 +554,59 @@ async def _exec_redirection_activer(client: WordPressClient, gate: WriteGate, p:
     return {"regles": [{"id": i, "active": v} for i, v in state.items()]}
 
 
+
+@mcp.tool()
+async def wp_page_regenerer_preparer(id: int, type_contenu: str = "page") -> dict[str, Any]:
+    """PRÉPARE l'équivalent du bouton « Mettre à jour » d'Elementor pour une page (ou un article)
+    construite avec Elementor ; n'écrit rien. Régénère le texte de secours (champ `content`, utilisé
+    par la recherche, le flux RSS et le résumé affiché quand on partage le lien) à partir du contenu
+    Elementor actuel, puis vide le cache Elementor. Le contenu affiché de la page ne change pas.
+    L'ancien texte de secours est sauvegardé localement."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    path = _content_path(type_contenu, id)
+    item, raw, _ = await _read_elementor(client, path)
+    if not _is_builder(item):
+        raise WordPressError("ce contenu n'est pas affiché par Elementor (mode « builder » inactif) : son "
+                             "champ content est le contenu réel, il ne faut pas le régénérer", code="pas_elementor")
+    current = _raw(item.get("content"))
+    new_content = E.build_fallback_html(raw)
+    if not new_content.strip():
+        raise WordPressError("aucun texte à extraire du contenu Elementor", code="aucun_changement")
+    if E.html_to_text(new_content) == E.html_to_text(current):
+        raise WordPressError("le texte de secours est déjà à jour", code="aucun_changement")
+    preview = {"contenu": f"{type_contenu} {id} « {_raw(item.get('title'))} »", "lien": item.get("link"),
+               "texte_de_secours_avant": _short(E.html_to_text(current), 700),
+               "texte_de_secours_apres": _short(E.html_to_text(new_content), 700),
+               "resume_de_partage_apres": _short(" ".join(E.html_to_text(new_content).split()), 160)}
+    return gate.prepare("page_regenerer", {"path": path, "new_content": new_content},
+                        summary=f"Régénérer le texte de secours de « {_raw(item.get('title'))} » (comme « Mettre à jour »)",
+                        preview=preview, guard=_guard_of(item, raw),
+                        warnings=["Le contenu affiché de la page ne change pas ; seuls la recherche, le flux RSS et "
+                                  "le résumé de partage sont mis à jour."])
+
+
+async def _exec_page_regenerer(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    path = p.args["path"]
+    item, raw, _ = await _check_guard(client, path, p.guard, "Le contenu Elementor")
+    backup = gate.save_backup(path.strip("/").split("/")[-2], int(item["id"]), _backup_payload(path, item, raw))
+    await client.write("POST", path, json={"content": p.args["new_content"]})
+    check = await client.get(path, {"context": "edit"})
+    if E.html_to_text(_raw(check.get("content"))) != E.html_to_text(p.args["new_content"]):
+        raise WordPressError("le texte relu ne correspond pas : restaurer depuis la sauvegarde si besoin",
+                             code="verification_echouee")
+    if (check.get("meta") or {}).get("_elementor_data") != raw:
+        raise WordPressError("le contenu Elementor a changé pendant l'écriture : vérifier la page",
+                             code="verification_echouee")
+    warnings = []
+    try:
+        await client.write("DELETE", "/elementor/v1/cache")
+    except WordPressError as e:
+        warnings.append(f"cache Elementor non vidé ({e})")
+    gate.journal("page_regenerer", True, chemin=path, sauvegarde=backup)
+    return {"lien": item.get("link"), "sauvegarde": backup, "avertissements": warnings}
+
 # ======================================================================= pages : titre et statut
 PAGE_STATUSES = {"publish": "publié", "draft": "brouillon", "private": "privé", "pending": "en attente de relecture"}
 
@@ -734,6 +796,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "page": _exec_page,
     "menu_entree": _exec_menu_entree,
     "medias_alt": _exec_medias_alt,
+    "page_regenerer": _exec_page_regenerer,
 }
 
 
