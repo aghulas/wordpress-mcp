@@ -10,6 +10,7 @@ passe d'application ne sont jamais renvoyés ni journalisés.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date
 from typing import Any
@@ -17,6 +18,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from . import elementor as E
+from . import mec as M
 from .client import WordPressClient, WordPressError
 
 log = logging.getLogger("wordpress_mcp.server")
@@ -375,23 +377,40 @@ async def wp_categories() -> dict[str, Any]:
 async def wp_evenements(a_venir: bool = True, recherche: str | None = None, statut: str = "publish",
                         limite: int = 50) -> list[dict[str, Any]]:
     """Événements du calendrier (Modern Events Calendar) : id, titre, lien, dates de début/fin
-    (métas mec_*), lieu, statut. `a_venir=False` pour inclure les événements passés. Sans compte,
-    les dates mec_* peuvent manquer (métas visibles en contexte edit)."""
+    (lues dans le JSON-LD de la page publique, MEC Lite ne les expose pas en REST), lieu, statut.
+    `a_venir=False` pour inclure les événements passés."""
     client = _get_client()
     items = await client.get_all("/wp/v2/mec-events", {"context": client.context, "search": recherche,
                                                         "status": statut, "orderby": "date", "order": "desc"},
                                  max(limite * 3, limite))
     today = date.today().isoformat()
+    sem = asyncio.Semaphore(5)
+
+    async def details(item: dict[str, Any]) -> dict[str, Any]:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        if meta.get("mec_start_date"):
+            return {"debut": meta.get("mec_start_date"), "fin": meta.get("mec_end_date") or meta.get("mec_start_date")}
+        link = item.get("link")
+        if not link:
+            return {}
+        try:  # l'API REST de MEC n'expose pas les dates : on lit le JSON-LD de la page publique
+            async with sem:
+                return M.parse_event_jsonld(await client.get_public_page(link))
+        except Exception as exc:  # noqa: BLE001 - une page en échec ne bloque pas la liste
+            log.warning("dates MEC illisibles pour l'événement %s : %s", item.get("id"), type(exc).__name__)
+            return {}
+
+    infos = await asyncio.gather(*(details(i) for i in items))
     out = []
-    for i in items:
-        meta = i.get("meta") if isinstance(i.get("meta"), dict) else {}
-        start = meta.get("mec_start_date") or None
-        end = meta.get("mec_end_date") or start
+    for i, d in zip(items, infos):
+        start, end = d.get("debut"), d.get("fin") or d.get("debut")
         if a_venir and end and str(end) < today:
             continue
+        meta = i.get("meta") if isinstance(i.get("meta"), dict) else {}
         s = _summary(i)
         s.update({"debut": start, "fin": end, "heure_debut": meta.get("mec_start_time_hour"),
-                  "lieu_id": meta.get("mec_location_id"), "repetition": meta.get("mec_repeat_type") or None,
+                  "lieu": d.get("lieu"), "lieu_id": meta.get("mec_location_id"),
+                  "repetition": meta.get("mec_repeat_type") or None,
                   "extrait": E.html_to_text(_rendered(i.get("excerpt")))[:300]})
         out.append(s)
     out.sort(key=lambda e: (e.get("debut") or "", e.get("date") or ""))

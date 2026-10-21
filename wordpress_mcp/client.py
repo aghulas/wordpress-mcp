@@ -209,6 +209,21 @@ class WordPressClient:
             page += 1
         return items[:limit]
 
+    async def get_public_page(self, url: str) -> str:
+        """HTML d'une page publique du MÊME site (GET, sans identifiants). Sert aux données que l'API
+        REST n'expose pas (dates MEC). Refuse tout autre domaine, tout schéma non https/http."""
+        from urllib.parse import urlsplit
+        want = (urlsplit(self.settings.base_url or str(self._http.base_url)).hostname or "").removeprefix("www.")
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
+            raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
+        async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
+                                     headers={"User-Agent": "wordpress-mcp/0.1 (lecture seule)"}) as http:
+            resp = await http.get(url)
+        if resp.status_code >= 400:
+            raise WordPressError(f"HTTP {resp.status_code}", status=resp.status_code)
+        return resp.text
+
     # ------------------------------------------------------------------ raccourcis
     async def site_info(self) -> dict[str, Any]:
         return await self.get("/")
