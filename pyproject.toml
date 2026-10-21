@@ -1,0 +1,33 @@
+[project]
+name = "wordpress-mcp"
+version = "0.1.0"
+description = "Serveur MCP (lecture seule) pour un site WordPress d'école — pages, articles, médias, menus, événements, formulaires, redirections, extensions"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.0",
+    "httpx[brotli]>=0.27",
+    "truststore>=0.9",
+]
+
+[project.optional-dependencies]
+# Tests uniquement — jamais nécessaire pour faire tourner le serveur MCP lui-même.
+# Installation : ./.venv/bin/pip install -e ".[dev]"
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[project.scripts]
+wordpress-mcp = "wordpress_mcp.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["wordpress_mcp*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
