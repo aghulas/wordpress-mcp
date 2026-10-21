@@ -213,3 +213,62 @@ def widgets_to_text(widgets: list[dict[str, Any]]) -> str:
             else:
                 lines.append(f"{indent}  {key}: {val}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- écriture (v2)
+def find_element(elements: list[dict[str, Any]], element_id: str) -> dict[str, Any] | None:
+    """Élément (widget, section…) d'identifiant `element_id` dans l'arbre décodé, ou None."""
+    for el, _ in walk(elements):
+        if str(el.get("id")) == str(element_id):
+            return el
+    return None
+
+
+def _split_path(path: str) -> list[str | int]:
+    parts: list[str | int] = []
+    for p in (path or "").split("."):
+        if not p:
+            raise ValueError(f"champ invalide : {path!r}")
+        parts.append(int(p) if p.isdigit() else p)
+    return parts
+
+
+def get_setting(settings: dict[str, Any], path: str) -> Any:
+    """Valeur d'un réglage : `editor`, `title`, `icon_list.2.text` (index de liste à partir de 0)."""
+    cur: Any = settings
+    for p in _split_path(path):
+        if isinstance(p, int):
+            if not isinstance(cur, list) or p >= len(cur):
+                raise ValueError(f"champ introuvable : {path}")
+            cur = cur[p]
+        else:
+            if not isinstance(cur, dict) or p not in cur:
+                raise ValueError(f"champ introuvable : {path}")
+            cur = cur[p]
+    return cur
+
+
+def set_setting(settings: dict[str, Any], path: str, value: str) -> None:
+    """Remplace un réglage texte EXISTANT (jamais de création de clé ni de changement de type)."""
+    parts = _split_path(path)
+    parent = get_setting(settings, ".".join(str(p) for p in parts[:-1])) if len(parts) > 1 else settings
+    last = parts[-1]
+    current = get_setting(settings, path)
+    if not isinstance(current, str):
+        raise ValueError(f"le champ {path} n'est pas un texte (type {type(current).__name__})")
+    if isinstance(last, int):
+        parent[last] = value
+    else:
+        parent[last] = value
+
+
+def is_html_field(path: str) -> bool:
+    """Champs Elementor dont la valeur est du HTML (éditeur de texte, descriptions…)."""
+    leaf = (path or "").split(".")[-1]
+    return leaf in {"editor", "description", "description_text", "content", "html", "tab_content",
+                    "item_description", "testimonial_content", "alert_description"}
+
+
+def dump_elementor_data(elements: list[dict[str, Any]]) -> str:
+    """Arbre → chaîne JSON compacte, comme Elementor la stocke."""
+    return json.dumps(elements, ensure_ascii=False, separators=(",", ":"))

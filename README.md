@@ -1,8 +1,10 @@
 # wordpress-mcp
 
-Serveur [MCP](https://modelcontextprotocol.io) en **lecture seule** pour un site WordPress, pensé pour le site d'une école (WordPress + Elementor + Modern Events Calendar + Redirection), mais utilisable sur n'importe quel site qui expose l'API REST `/wp-json`.
+Serveur [MCP](https://modelcontextprotocol.io) pour un site WordPress, pensé pour le site d'une école (WordPress + Elementor + Modern Events Calendar + Redirection), mais utilisable sur n'importe quel site qui expose l'API REST `/wp-json`.
 
-Il permet à Claude (Claude Desktop) de relire le contenu du site, de retrouver un texte, d'auditer les extensions, les redirections, les 404 et les soumissions de formulaires, et de préparer des mises à jour — que l'utilisateur fera ensuite lui-même dans `wp-admin`. **Rien n'est créé, modifié ni supprimé** : seule la méthode `GET` est autorisée, et seuls quelques espaces de noms REST sont joignables (cœur `wp/v2`, Elementor, MEC, Redirection, santé du site).
+Il permet à Claude (Claude Desktop) de relire le contenu du site, de retrouver un texte, d'auditer les extensions, les redirections, les 404 et les soumissions de formulaires, et de faire le bilan de santé du site. Par défaut il est en **lecture seule** : seule la méthode `GET` est autorisée, et seuls quelques espaces de noms REST sont joignables (cœur `wp/v2`, Elementor, MEC, Redirection, santé du site).
+
+Avec `WP_ENABLE_WRITES=1`, il peut aussi **écrire, toujours en deux temps** : un outil `*_preparer` montre l'aperçu (avant → après) et renvoie un jeton ; rien ne change tant que l'utilisateur n'a pas donné son accord et que `wp_ecriture_confirmer` n'a pas été appelé. Aucune suppression n'est possible.
 
 ## Installation
 
@@ -30,6 +32,11 @@ Variables d'environnement :
 | `WP_PASSWORD` | (mode cookie) mot de passe WordPress du compte |
 | `WP_TIMEOUT` | délai HTTP en secondes (défaut 30) |
 | `WP_PER_PAGE_MAX` | plafond d'éléments renvoyés par un outil de liste (défaut 200) |
+| `WP_ENABLE_WRITES` | `1` pour autoriser les écritures avec confirmation (défaut : désactivées) |
+| `WP_WRITE_TTL` | validité d'un jeton de confirmation, en secondes (défaut 600) |
+| `WP_BACKUP_DIR` | sauvegardes locales des pages modifiées et journal des écritures (défaut `~/.wordpress-mcp/sauvegardes`) |
+| `WP_UPLOAD_ROOTS` | dossiers d'où un fichier peut être envoyé, séparés par `:` (défaut `~/Documents:~/Downloads:~/Desktop`) |
+| `WP_UPLOAD_MAX_MB` | taille maximale d'un fichier envoyé (défaut 20) |
 
 `claude_desktop_config.json` :
 
@@ -45,7 +52,7 @@ Variables d'environnement :
 }
 ```
 
-## Outils (16, lecture seule)
+## Outils de lecture (17)
 
 | Outil | Rôle | Compte requis | Validé en réel |
 |---|---|---|---|
@@ -66,6 +73,28 @@ Variables d'environnement :
 | `wp_extensions` | extensions installées, inactives, thème actif | admin | ✔ |
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
+
+## Outils d'écriture (9, avec `WP_ENABLE_WRITES=1`)
+
+| Outil | Rôle |
+|---|---|
+| `wp_article_preparer` | créer ou modifier un article (titre, texte HTML ou brut, catégories existantes, image à la une, extrait, statut : brouillon, en attente, publié, programmé, privé) |
+| `wp_widget_texte_preparer` | remplacer le texte d'un widget Elementor (`title`, `editor`, `icon_list.2.text`…) d'une page ou d'un article ; sauvegarde locale de l'ancien contenu, relecture, vidage du cache Elementor |
+| `wp_page_restaurer_preparer` | revenir à une sauvegarde locale (le contenu actuel est sauvegardé avant) |
+| `wp_media_envoyer_preparer` | envoyer une image (JPG, PNG, GIF, WEBP) ou un PDF du poste dans la médiathèque, avec titre, texte alternatif, légende |
+| `wp_redirection_preparer` | créer une règle de l'extension Redirection (301, 302, 307, 308) |
+| `wp_redirection_activer_preparer` | activer ou désactiver des règles (jamais de suppression) |
+| `wp_ecriture_confirmer` | exécuter une écriture préparée, après accord explicite de l'utilisateur |
+| `wp_ecriture_annuler` / `wp_ecritures_en_attente` | abandonner une écriture préparée / lister celles en attente |
+
+Verrous (`writes.py`, `client.py`) :
+1. `WP_ENABLE_WRITES=1` obligatoire, sinon même la préparation est refusée.
+2. Jeton aléatoire, à usage unique, valable 10 minutes ; l'écriture exécutée est exactement celle de l'aperçu.
+3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, contenu Elementor d'une page ou d'un article existant, envoi d'un média et de ses textes, création et activation de redirections, vidage du cache Elementor. Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
+4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, empreinte du contenu, empreinte du fichier), l'écriture est refusée.
+5. Avant toute modification d'un contenu Elementor : sauvegarde JSON dans `WP_BACKUP_DIR` ; après : relecture et comparaison. Journal `journal.jsonl` (date, opération, identifiants, issue — jamais le contenu).
+
+Remplacer un PDF en ligne : WordPress donne une nouvelle adresse à chaque envoi ; envoyer le nouveau fichier puis mettre à jour les liens avec `wp_widget_texte_preparer`.
 
 ## Modes d'authentification
 
@@ -89,16 +118,17 @@ Une page Elementor stocke sa mise en page dans la méta `_elementor_data` (JSON)
 
 ## Sécurité
 
-- `client.check_read_only` refuse toute méthode autre que `GET`/`HEAD` et tout espace de noms hors liste blanche — avant même d'ouvrir une connexion (test `test_request_refuses_write_before_any_http`). Les espaces d'export/import/installation (`batch/v1`, `ai1wm`, `elementor-one`, `image-optimizer`, `hub-connector`…) sont volontairement exclus.
+- Lecture : `client.check_read_only` refuse toute méthode autre que `GET`/`HEAD` et tout espace de noms hors liste blanche — avant même d'ouvrir une connexion (test `test_request_refuses_write_before_any_http`). Les espaces d'export/import/installation (`batch/v1`, `ai1wm`, `elementor-one`, `image-optimizer`, `hub-connector`…) sont volontairement exclus.
 - Le mot de passe d'application et le mot de passe du mode cookie ne sont jamais renvoyés par un outil ni journalisé (`httpx` au niveau WARNING, logs sur stderr).
 - Les soumissions de formulaires contiennent des données personnelles : à ne consulter qu'au besoin.
 - `wp_sante` interroge aussi `api.wordpress.org` (module `wporg.py`) : hôte et chemins fixes, GET seulement, aucun identifiant envoyé ; seul le nom public (slug) des extensions et thèmes installés part. `mises_a_jour=False` évite cet appel.
+- Écriture : seulement par `client.write`, appelée par les exécuteurs de `write_tools.py` après confirmation, et limitée à `ALLOWED_WRITES` (voir « Outils d'écriture »). Tests : `tests/test_writes.py`.
 - Le transport `streamable-http` est désactivé tant qu'il n'y a pas d'authentification par utilisateur (voir `mcp-entra-auth`).
 
 ## Évolutions prévues
 
-- Écriture avec garde-fou aperçu / confirmation (brouillon d'article, texte d'un widget Elementor, remplacement d'un PDF), comme dans `edumoov-mcp`.
-- Santé du site (`wp-site-health/v1`) : versions PHP/WordPress, mises à jour disponibles.
+- Événements Modern Events Calendar en écriture (dates hors API REST : nécessite une route côté site).
+- Version PHP et tests « directs » de Santé du site (route côté site).
 - Déploiement distant.
 
 ## Développement

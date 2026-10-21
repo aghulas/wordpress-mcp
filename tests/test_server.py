@@ -278,10 +278,14 @@ async def test_utilisateurs_and_revisions():
 async def test_tool_count():
     tools = await S.mcp.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 17
+    assert len(tools) == 26
     assert all(n.startswith("wp_") for n in names)
-    # Aucun outil d'écriture ne doit exister dans cette version.
-    assert not any(k in n for n in names for k in ("prepare", "confirm", "create", "update", "delete", "upload"))
+    # Écritures : uniquement des outils de préparation + confirmation, aucune suppression.
+    writers = {n for n in names if n.endswith("_preparer") or n.startswith("wp_ecriture")}
+    assert writers == {"wp_article_preparer", "wp_widget_texte_preparer", "wp_page_restaurer_preparer",
+                       "wp_media_envoyer_preparer", "wp_redirection_preparer", "wp_redirection_activer_preparer",
+                       "wp_ecriture_confirmer", "wp_ecriture_annuler", "wp_ecritures_en_attente"}
+    assert not any(k in n for n in names for k in ("delete", "supprim", "upload", "create", "update"))
 
 
 def _health(status, label, actions=""):

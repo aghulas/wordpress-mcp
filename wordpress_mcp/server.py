@@ -5,8 +5,9 @@ Outils :
   wp_revisions, wp_recherche, wp_medias_list, wp_menus, wp_categories, wp_evenements,
   wp_formulaires_soumissions, wp_redirections, wp_extensions, wp_utilisateurs, wp_sante
 
-Aucune écriture : seule la méthode GET est autorisée par le client (voir client.py). Les mots de
-passe d'application ne sont jamais renvoyés ni journalisés.
+Lecture : seule la méthode GET passe par `client.request` (voir client.py). Écritures (v2) :
+outils *_preparer + wp_ecriture_confirmer dans write_tools.py, désactivés sauf WP_ENABLE_WRITES=1.
+Les mots de passe d'application ne sont jamais renvoyés ni journalisés.
 """
 from __future__ import annotations
 
@@ -28,13 +29,14 @@ mcp = MCPServer(
     name="wordpress",
     title="Site WordPress (lecture seule)",
     instructions=(
-        "Accès en LECTURE SEULE au site WordPress configuré (WP_BASE_URL) via son API REST, avec un "
-        "mot de passe d'application. Ce connecteur ne crée, ne modifie et ne supprime rien : il sert à "
-        "relire le contenu (pages, articles, médias, menus, événements), à retrouver un texte, à auditer "
-        "le site (santé, mises à jour, extensions, redirections, 404, soumissions de formulaires) et à préparer des mises à jour "
-        "que l'utilisateur fera ensuite lui-même dans wp-admin. Les pages construites avec Elementor sont "
-        "lues widget par widget (wp_contenu_lire, format 'elementor'). Commencer par wp_statut pour "
-        "vérifier la connexion et les droits ; sans identifiants, seul le contenu publié est visible."
+        "Accès au site WordPress configuré (WP_BASE_URL) via son API REST, avec un mot de passe "
+        "d'application. Lecture : relire le contenu (pages, articles, médias, menus, événements), retrouver "
+        "un texte, auditer le site (santé, mises à jour, extensions, redirections, 404, formulaires). Les "
+        "pages Elementor sont lues widget par widget (wp_contenu_lire, format 'elementor'). Écriture "
+        "(seulement si wp_statut indique « écritures activées ») : toujours en deux temps — un outil "
+        "*_preparer renvoie un aperçu avant → après et un jeton ; montrer l'aperçu à l'utilisateur et "
+        "n'appeler wp_ecriture_confirmer qu'après son accord explicite. Aucune suppression n'est possible. "
+        "Commencer par wp_statut pour vérifier la connexion, les droits et le mode."
     ),
 )
 
@@ -125,7 +127,8 @@ async def wp_statut() -> dict[str, Any]:
         "identifiants_configures": st.authenticated,
         "utilisateur": st.user,
         "authentification": st.auth_mode,
-        "mode": "lecture seule",
+        "mode": ("lecture + écriture avec aperçu et confirmation" if st.enable_writes else "lecture seule"),
+        "ecritures": "activées (confirmation obligatoire)" if st.enable_writes else "désactivées",
     }
     try:
         info = await client.site_info()
@@ -702,3 +705,7 @@ async def wp_sante(mises_a_jour: bool = True) -> dict[str, Any]:
         except WordPressError as e:
             out["versions"] = {"erreur": str(e)}
     return out
+
+
+# Outils d'écriture (v2) : enregistrés sur le même serveur, inactifs sans WP_ENABLE_WRITES=1.
+from . import write_tools  # noqa: E402,F401

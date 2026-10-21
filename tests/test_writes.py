@@ -1,0 +1,333 @@
+"""Écritures v2 : verrous (désactivé, liste blanche, jeton, fraîcheur) et chaque outil, site fictif."""
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+import respx
+
+from wordpress_mcp import server as S
+from wordpress_mcp import write_tools as WT
+from wordpress_mcp.client import WordPressError, check_write_allowed
+
+from ._helpers import BASE, ELEMENTOR_DATA, make_client
+
+
+@pytest.fixture
+def writes_on(monkeypatch, tmp_path):
+    uploads = tmp_path / "Documents"
+    uploads.mkdir()
+    client = make_client(enable_writes=True, backup_dir=str(tmp_path / "sauvegardes"),
+                         upload_roots=(str(uploads),), upload_max_mb=1)
+    monkeypatch.setattr(S, "_client", client)
+    return client
+
+
+@pytest.fixture
+def writes_off(monkeypatch):
+    client = make_client(enable_writes=False)
+    monkeypatch.setattr(S, "_client", client)
+    return client
+
+
+def _writes():
+    return [c for c in respx.calls if c.request.method != "GET"]
+
+
+# ------------------------------------------------------------------ verrous
+@pytest.mark.parametrize("method,path", [("POST", "/wp/v2/posts"), ("POST", "wp/v2/posts/12"),
+                                         ("POST", "/wp/v2/pages/644"), ("POST", "/wp/v2/media"),
+                                         ("POST", "/wp/v2/media/9"), ("POST", "/redirection/v1/redirect"),
+                                         ("POST", "/redirection/v1/bulk/redirect/disable"),
+                                         ("DELETE", "/elementor/v1/cache")])
+def test_allowed_writes(method, path):
+    check_write_allowed(method, path)
+
+
+@pytest.mark.parametrize("method,path", [("DELETE", "/wp/v2/posts/12"), ("DELETE", "/wp/v2/media/9"),
+                                         ("POST", "/wp/v2/users"), ("POST", "/wp/v2/plugins"),
+                                         ("POST", "/wp/v2/settings"), ("PUT", "/wp/v2/pages/644"),
+                                         ("POST", "/redirection/v1/bulk/redirect/delete"),
+                                         ("POST", "/wp/v2/pages"), ("POST", "/wp/v2/posts/12/../../users"),
+                                         ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x")])
+def test_refused_writes(method, path):
+    with pytest.raises(WordPressError) as e:
+        check_write_allowed(method, path)
+    assert e.value.code == "ecriture_refusee"
+
+
+@respx.mock
+async def test_client_write_refused_when_disabled(writes_off):
+    with pytest.raises(WordPressError) as e:
+        await writes_off.write("POST", "/wp/v2/posts", json={"title": "x"})
+    assert e.value.code == "ecritures_desactivees" and not respx.calls
+
+
+@respx.mock
+async def test_prepare_refused_when_disabled(writes_off):
+    with pytest.raises(Exception) as e:
+        await WT.wp_article_preparer(titre="T", contenu="x")
+    assert "WP_ENABLE_WRITES" in str(e.value) and not respx.calls
+
+
+# ------------------------------------------------------------------ articles
+CATS = [{"id": 3, "name": "Information", "slug": "information"}, {"id": 4, "name": "Vie de l&rsquo;école", "slug": "vie"}]
+
+
+@respx.mock
+async def test_article_create_confirm_and_token_single_use(writes_on):
+    respx.get(f"{BASE}/wp-json/wp/v2/categories").mock(return_value=httpx.Response(200, json=CATS))
+    created = respx.post(f"{BASE}/wp-json/wp/v2/posts").mock(return_value=httpx.Response(201, json={
+        "id": 501, "status": "draft", "link": f"{BASE}/?p=501"}))
+    prep = await WT.wp_article_preparer(titre="Kermesse", contenu="Bonjour à tous.\n\nRendez-vous <samedi>.",
+                                        categories=["information"])
+    assert prep["statut"].startswith("EN ATTENTE") and not _writes()
+    assert prep["apercu"]["categories"] == ["Information"] and prep["avertissements"] == []
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    body = json.loads(created.calls.last.request.content)
+    assert body == {"status": "draft", "title": "Kermesse", "categories": [3],
+                    "content": "<p>Bonjour à tous.</p>\n<p>Rendez-vous &lt;samedi&gt;.</p>"}
+    assert out["id"] == 501 and out["statut"] == "brouillon" and "preview=true" in out["apercu"]
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "jeton_invalide" and created.call_count == 1
+    journal = (writes_on.settings and __import__("pathlib").Path(writes_on.settings.backup_dir) / "journal.jsonl")
+    assert "Kermesse" not in journal.read_text() and '"operation": "article"' in journal.read_text()
+
+
+@respx.mock
+async def test_article_publish_warning_and_unknown_category(writes_on):
+    respx.get(f"{BASE}/wp-json/wp/v2/categories").mock(return_value=httpx.Response(200, json=CATS))
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_article_preparer(titre="T", contenu="x", categories=["Sport"])
+    assert e.value.code == "categorie_inconnue" and "Vie de l’école" in str(e.value)
+    prep = await WT.wp_article_preparer(titre="T", contenu="<p>x</p>", statut="publish")
+    assert "VISIBLE IMMÉDIATEMENT" in prep["avertissements"][0]
+    with pytest.raises(WordPressError):
+        await WT.wp_article_preparer(titre="T", contenu="x", statut="future")
+
+
+ARTICLE = {"id": 100, "status": "publish", "link": f"{BASE}/rentree/", "modified": "2026-09-01T08:00:00",
+           "title": {"raw": "Rentrée"}, "content": {"raw": "<p>Texte.</p>"}, "excerpt": {"raw": ""},
+           "date": "2026-09-01T08:00:00", "categories": [3], "featured_media": 0}
+
+
+@respx.mock
+async def test_article_update_refused_if_modified_in_between(writes_on):
+    route = respx.get(f"{BASE}/wp-json/wp/v2/posts/100").mock(return_value=httpx.Response(200, json=ARTICLE))
+    post = respx.post(f"{BASE}/wp-json/wp/v2/posts/100").mock(return_value=httpx.Response(200, json=ARTICLE))
+    prep = await WT.wp_article_preparer(id=100, contenu="Nouveau texte.", statut="publish")
+    assert prep["apercu"]["changements"]["content"] == {"avant": "Texte.", "apres": "Nouveau texte."}
+    assert "title" not in prep["apercu"]["changements"]
+    route.mock(return_value=httpx.Response(200, json={**ARTICLE, "modified": "2026-10-21T20:00:00"}))
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and not post.called
+
+
+@respx.mock
+async def test_article_update_no_change(writes_on):
+    respx.get(f"{BASE}/wp-json/wp/v2/posts/100").mock(return_value=httpx.Response(200, json=ARTICLE))
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_article_preparer(id=100, titre="Rentrée", statut="publish")
+    assert e.value.code == "aucun_changement"
+
+
+async def test_expired_token(monkeypatch, tmp_path):
+    client = make_client(enable_writes=True, write_ttl_seconds=-1, backup_dir=str(tmp_path))
+    monkeypatch.setattr(S, "_client", client)
+    prep = WT._get_gate().prepare("article", {}, summary="x", preview={})
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "jeton_invalide"
+
+
+# ------------------------------------------------------------------ widgets Elementor
+class FakePage:
+    """Page 10 dont le contenu Elementor évolue au fil des POST (relecture après écriture)."""
+
+    def __init__(self, raw=ELEMENTOR_DATA, content="<p>Premier paragraphe.</p><p>Second&nbsp;paragraphe.</p>"):
+        self.raw, self.content, self.n = raw, content, 0
+
+    def json(self):
+        return {"id": 10, "status": "publish", "link": f"{BASE}/accueil/", "title": {"raw": "Accueil"},
+                "modified": f"2026-10-21T10:00:0{self.n}", "content": {"raw": self.content},
+                "meta": {"_elementor_data": self.raw}}
+
+    def get(self, request):
+        return httpx.Response(200, json=self.json())
+
+    def post(self, request):
+        body = json.loads(request.content)
+        self.raw = body["meta"]["_elementor_data"]
+        self.content = body.get("content", self.content)
+        self.n += 1
+        return httpx.Response(200, json=self.json())
+
+
+@respx.mock
+async def test_widget_text_backup_write_verify_and_restore(writes_on):
+    page = FakePage()
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.get)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.post)
+    cache = respx.delete(f"{BASE}/wp-json/elementor/v1/cache").mock(return_value=httpx.Response(200, json=True))
+    prep = await WT.wp_widget_texte_preparer(10, "w4", "icon_list.1.text", "Élémentaire (CP-CM2)")
+    assert prep["apercu"]["avant"] == "Élémentaire" and prep["apercu"]["apres"] == "Élémentaire (CP-CM2)"
+    assert "VISIBLE IMMÉDIATEMENT" in prep["avertissements"][0] and not _writes()
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    tree = json.loads(page.raw)
+    assert tree[0]["elements"][0]["elements"][3]["settings"]["icon_list"][1]["text"] == "Élémentaire (CP-CM2)"
+    assert tree[0]["elements"][0]["elements"][0]["settings"]["title"] == "Bienvenue &agrave; l'&eacute;cole"
+    assert cache.called and out["avertissements"] == []
+    backup = WT._get_gate().load_backup(out["sauvegarde"])
+    assert backup["elementor_data"] == ELEMENTOR_DATA and backup["chemin"] == "/wp/v2/pages/10"
+    # restauration : aperçu des widgets qui changent, puis écriture de l'ancien contenu
+    prep2 = await WT.wp_page_restaurer_preparer(out["sauvegarde"])
+    assert prep2["apercu"]["nombre_widgets_modifies"] == 1 and prep2["apercu"]["widgets_modifies"][0]["widget"] == "w4"
+    out2 = await WT.wp_ecriture_confirmer(prep2["jeton"])
+    assert json.loads(page.raw) == json.loads(ELEMENTOR_DATA) and post.call_count == 2
+    assert out2["sauvegarde_avant_restauration"] != out["sauvegarde"]
+
+
+@respx.mock
+async def test_widget_html_field_updates_fallback_content(writes_on):
+    page = FakePage()
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.get)
+    respx.post(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.post)
+    respx.delete(f"{BASE}/wp-json/elementor/v1/cache").mock(return_value=httpx.Response(500, json={"code": "x"}))
+    prep = await WT.wp_widget_texte_preparer(10, "w2", "editor", "Nouveau paragraphe.")
+    assert prep["apercu"]["apres_html"] == "<p>Nouveau paragraphe.</p>"
+    assert len(prep["avertissements"]) == 1  # texte de secours mis à jour : pas d'avertissement dédié
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert page.content == "<p>Nouveau paragraphe.</p>"
+    assert "cache Elementor non vidé" in out["avertissements"][0]
+
+
+@respx.mock
+async def test_widget_refused_if_page_changed_and_bad_targets(writes_on):
+    page = FakePage()
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.get)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.post)
+    for widget, champ, code in (("zz", "title", "widget_introuvable"), ("w1", "inexistant", "champ_introuvable"),
+                                ("w4", "icon_list", "champ_introuvable"), ("w1", "title", "aucun_changement")):
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_widget_texte_preparer(10, widget, champ, "Bienvenue &agrave; l'&eacute;cole")
+        assert e.value.code == code, (widget, champ)
+    prep = await WT.wp_widget_texte_preparer(10, "w1", "title", "Bienvenue")
+    page.n = 5  # quelqu'un a enregistré la page dans Elementor entre-temps
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and not post.called
+
+
+async def test_restore_refuses_path_tricks(writes_on):
+    for name in ("../journal.jsonl", "/etc/passwd", ".cache.json", "x.txt"):
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_page_restaurer_preparer(name)
+        assert e.value.code == "sauvegarde_invalide"
+
+
+# ------------------------------------------------------------------ médiathèque
+@respx.mock
+async def test_media_upload(writes_on, tmp_path):
+    f = tmp_path / "Documents" / "Règlement 2026.pdf"
+    f.write_bytes(b"%PDF-1.4 test")
+    respx.get(f"{BASE}/wp-json/wp/v2/media").mock(return_value=httpx.Response(200, json=[]))
+    up = respx.post(f"{BASE}/wp-json/wp/v2/media").mock(return_value=httpx.Response(201, json={
+        "id": 77, "source_url": f"{BASE}/wp-content/uploads/reglement.pdf", "link": f"{BASE}/reglement/"}))
+    meta = respx.post(f"{BASE}/wp-json/wp/v2/media/77").mock(return_value=httpx.Response(200, json={
+        "id": 77, "source_url": f"{BASE}/wp-content/uploads/reglement.pdf", "link": f"{BASE}/reglement/"}))
+    prep = await WT.wp_media_envoyer_preparer(str(f), titre="Règlement intérieur 2026")
+    assert prep["apercu"]["type"] == "application/pdf" and not _writes()
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    req = up.calls.last.request
+    assert req.content == b"%PDF-1.4 test" and req.headers["content-type"] == "application/pdf"
+    assert "filename*=UTF-8''R%C3%A8glement%202026.pdf" in req.headers["content-disposition"]
+    assert json.loads(meta.calls.last.request.content) == {"title": "Règlement intérieur 2026"}
+    assert out["id"] == 77 and out["url"].endswith("reglement.pdf")
+
+
+@respx.mock
+async def test_media_refusals(writes_on, tmp_path):
+    outside = tmp_path / "secret.pdf"
+    outside.write_bytes(b"x")
+    exe = tmp_path / "Documents" / "script.sh"
+    exe.write_bytes(b"x")
+    big = tmp_path / "Documents" / "gros.jpg"
+    big.write_bytes(b"0" * (1024 * 1024 + 1))
+    for path in (outside, exe, big, tmp_path / "Documents" / "absent.png",
+                 tmp_path / "Documents" / ".." / "secret.pdf"):
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_media_envoyer_preparer(str(path))
+        assert e.value.code == "fichier_refuse", path
+    ok = tmp_path / "Documents" / "photo.png"
+    ok.write_bytes(b"png1")
+    respx.get(f"{BASE}/wp-json/wp/v2/media").mock(return_value=httpx.Response(200, json=[]))
+    up = respx.post(f"{BASE}/wp-json/wp/v2/media")
+    prep = await WT.wp_media_envoyer_preparer(str(ok))
+    assert any("texte alternatif" in w for w in prep["avertissements"])
+    ok.write_bytes(b"png2 modifie")  # le fichier change entre l'aperçu et la confirmation
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and not up.called
+
+
+# ------------------------------------------------------------------ redirections
+GROUPS = {"items": [{"id": 1, "name": "Redirections", "enabled": True}, {"id": 2, "name": "Articles modifiés"}]}
+RULES = [{"id": 5, "url": "/ancien", "action_data": {"url": "/nouveau"}, "enabled": True, "hits": 3},
+         {"id": 6, "url": "/lorem", "action_data": {"url": "/ipsum"}, "enabled": True, "hits": 0}]
+
+
+@respx.mock
+async def test_redirection_create(writes_on):
+    state = {"items": list(RULES)}
+    respx.get(f"{BASE}/wp-json/redirection/v1/group").mock(return_value=httpx.Response(200, json=GROUPS))
+    respx.get(f"{BASE}/wp-json/redirection/v1/redirect").mock(side_effect=lambda r: httpx.Response(200, json=state))
+
+    def create(request):
+        body = json.loads(request.content)
+        state["items"] = state["items"] + [{"id": 9, "url": body["url"], "action_data": body["action_data"], "enabled": True}]
+        return httpx.Response(200, json=state)
+    post = respx.post(f"{BASE}/wp-json/redirection/v1/redirect").mock(side_effect=create)
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_redirection_preparer("/ancien/", "/ailleurs")
+    assert e.value.code == "doublon"
+    for src, tgt, code in (("ancien", "/x", 301), ("/a", "/a/", 301), ("/a", "/b", 404), ("//evil.com", "/b", 301)):
+        with pytest.raises(WordPressError):
+            await WT.wp_redirection_preparer(src, tgt, code)
+    prep = await WT.wp_redirection_preparer("https://www.wp.test/tarifs-2024", "/tarifs/")
+    assert prep["apercu"] == {"source": "/tarifs-2024", "cible": "/tarifs/", "code": 301, "groupe": "Redirections"}
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    body = json.loads(post.calls.last.request.content)
+    assert body["url"] == "/tarifs-2024" and body["action_code"] == 301 and body["group_id"] == 1
+    assert body["match_data"]["source"]["flag_regex"] is False and out["id"] == 9
+
+
+@respx.mock
+async def test_redirection_disable(writes_on):
+    state = {"items": [dict(r) for r in RULES]}
+    respx.get(f"{BASE}/wp-json/redirection/v1/redirect").mock(side_effect=lambda r: httpx.Response(200, json=state))
+
+    def bulk(request):
+        for r in state["items"]:
+            if r["id"] in json.loads(request.content)["items"]:
+                r["enabled"] = False
+        return httpx.Response(200, json=state)
+    route = respx.post(f"{BASE}/wp-json/redirection/v1/bulk/redirect/disable").mock(side_effect=bulk)
+    with pytest.raises(WordPressError):
+        await WT.wp_redirection_activer_preparer([99], active=False)
+    prep = await WT.wp_redirection_activer_preparer([6], active=False)
+    assert prep["apercu"]["regles"][0]["source"] == "/lorem" and not route.called
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert out["regles"] == [{"id": 6, "active": False}]
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_redirection_activer_preparer([6], active=False)
+    assert e.value.code == "aucun_changement"
+
+
+async def test_cancel_and_pending(writes_on):
+    prep = WT._get_gate().prepare("article", {}, summary="x", preview={})
+    assert (await WT.wp_ecritures_en_attente())["en_attente"][0]["jeton"] == prep["jeton"]
+    assert (await WT.wp_ecriture_annuler(prep["jeton"]))["annule"] is True
+    assert (await WT.wp_ecritures_en_attente())["en_attente"] == []

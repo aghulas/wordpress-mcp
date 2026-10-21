@@ -17,7 +17,7 @@ from .server import mcp
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serveur MCP WordPress, lecture seule")
+    parser = argparse.ArgumentParser(description="Serveur MCP WordPress (lecture, écriture avec confirmation)")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()

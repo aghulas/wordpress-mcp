@@ -10,6 +10,9 @@ Authentification, deux modes (WP_AUTH_MODE) :
     admin-ajax.php?action=rest-nonce et envoyé dans X-WP-Nonce. Utile quand l'hébergeur retire
     l'en-tête Authorization. Le POST de connexion est la seule écriture réseau possible ; il vise
     un chemin fixe et ne passe pas par `request`, qui reste en lecture seule.
+Écritures (v2) : uniquement par `write`, appelée par writes.py APRÈS confirmation explicite d'un
+aperçu. Trois verrous : WP_ENABLE_WRITES=1, liste blanche `ALLOWED_WRITES` (méthode + chemin exact),
+aucune suppression de contenu (seul DELETE autorisé : vidage du cache Elementor).
 Sans identifiants, le client interroge l'API en anonyme (contenu publié uniquement, pas de
 brouillons, pas de menus, pas de formulaires, pas d'extensions).
 """
@@ -49,6 +52,18 @@ ALLOWED_NAMESPACES: frozenset[str] = frozenset({
 
 READ_METHODS: frozenset[str] = frozenset({"GET", "HEAD"})
 
+# Écritures autorisées (v2) : méthode + chemin exact. Aucune suppression de contenu.
+ALLOWED_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/wp/v2/posts$")),                              # créer un article
+    ("POST", re.compile(r"^/wp/v2/posts/\d+$")),                          # modifier un article
+    ("POST", re.compile(r"^/wp/v2/pages/\d+$")),                          # texte Elementor d'une page
+    ("POST", re.compile(r"^/wp/v2/media$")),                              # envoyer un fichier
+    ("POST", re.compile(r"^/wp/v2/media/\d+$")),                          # titre / alt / légende du fichier
+    ("POST", re.compile(r"^/redirection/v1/redirect$")),                  # créer une redirection
+    ("POST", re.compile(r"^/redirection/v1/bulk/redirect/(enable|disable)$")),  # activer / désactiver
+    ("DELETE", re.compile(r"^/elementor/v1/cache$")),                     # vider le cache Elementor
+)
+
 
 class WordPressError(Exception):
     """Erreur renvoyée par WordPress (code + message) ou refus du garde-fou."""
@@ -82,6 +97,13 @@ def check_read_only(method: str, path: str) -> None:
         raise WordPressError(f"espace de noms REST non autorisé : {ns or '/'}", code="namespace_refuse")
 
 
+def check_write_allowed(method: str, path: str) -> None:
+    """Lève WordPressError si (méthode, chemin) n'est pas une écriture de la liste blanche."""
+    clean = "/" + path.strip("/")
+    if not any(m == method.upper() and rx.fullmatch(clean) for m, rx in ALLOWED_WRITES):
+        raise WordPressError(f"écriture non autorisée : {method.upper()} {clean}", code="ecriture_refusee")
+
+
 class WordPressClient:
     def __init__(self, settings: Settings | None = None, http: httpx.AsyncClient | None = None):
         self.settings = settings or SETTINGS
@@ -110,7 +132,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.1 (lecture seule)",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.2",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -188,6 +210,37 @@ class WordPressClient:
             raise WordPressError(message, code=code, status=resp.status_code)
         return resp
 
+    async def write(self, method: str, path: str, *, json: Any = None, content: bytes | None = None,
+                    headers: dict[str, str] | None = None, params: dict[str, Any] | None = None) -> Any:
+        """Écriture REST — à n'appeler que depuis writes.py, après confirmation d'un aperçu."""
+        if not self.settings.enable_writes:
+            raise WordPressError("écritures désactivées (WP_ENABLE_WRITES≠1)", code="ecritures_desactivees")
+        check_write_allowed(method, path)
+        if not self.settings.authenticated:
+            raise WordPressError("écriture impossible sans identifiants", code="config")
+        url = API_PREFIX + "/" + path.strip("/")
+        hdrs = dict(headers or {})
+        if self._cookie_mode:
+            if self._nonce is None:
+                await self._ensure_login()
+            hdrs["X-WP-Nonce"] = self._nonce or ""
+        resp = await self._http.request(method.upper(), url, params=params, json=json, content=content,
+                                        headers=hdrs or None)
+        if resp.status_code >= 400:
+            code, message = None, f"HTTP {resp.status_code}"
+            try:
+                body = resp.json()
+                code, message = body.get("code"), body.get("message") or message
+            except ValueError:
+                pass
+            raise WordPressError(message, code=code, status=resp.status_code)
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
     async def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return (await self.request("GET", path, params)).json()
 
@@ -219,7 +272,7 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.1 (lecture seule)"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.2"}) as http:
             resp = await http.get(url)
         if resp.status_code >= 400:
             raise WordPressError(f"HTTP {resp.status_code}", status=resp.status_code)
