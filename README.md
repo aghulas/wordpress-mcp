@@ -74,13 +74,16 @@ Variables d'environnement :
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
 
-## Outils d'écriture (9, avec `WP_ENABLE_WRITES=1`)
+## Outils d'écriture (12, avec `WP_ENABLE_WRITES=1`)
 
 | Outil | Rôle |
 |---|---|
 | `wp_article_preparer` | créer ou modifier un article (titre, texte HTML ou brut, catégories existantes, image à la une, extrait, statut : brouillon, en attente, publié, programmé, privé) |
-| `wp_widget_texte_preparer` | remplacer le texte d'un widget Elementor (`title`, `editor`, `icon_list.2.text`…) d'une page ou d'un article ; sauvegarde locale de l'ancien contenu, relecture, vidage du cache Elementor |
+| `wp_widget_texte_preparer` | remplacer le texte d'un widget Elementor (`title`, `editor`, `icon_list.2.text`…) d'une page ou d'un article — en entier, ou seulement un extrait avec `remplacer` (le reste du bloc et sa mise en forme sont conservés ; espaces insécables et apostrophes tolérés) ; sauvegarde locale de l'ancien contenu, relecture, vidage du cache Elementor |
 | `wp_page_restaurer_preparer` | revenir à une sauvegarde locale (le contenu actuel est sauvegardé avant) |
+| `wp_page_preparer` | changer le titre et/ou le statut d'une page ou d'un article existant (brouillon, privé, en attente, publié) ; signale les entrées de menu qui pointent vers la page |
+| `wp_menu_entree_preparer` | modifier une entrée de menu : la faire pointer vers une autre page publiée ou une adresse, changer son libellé, la masquer (statut brouillon, réversible) |
+| `wp_medias_alt_preparer` | textes alternatifs (et titres, légendes) de 1 à 50 images en une fois |
 | `wp_media_envoyer_preparer` | envoyer une image (JPG, PNG, GIF, WEBP) ou un PDF du poste dans la médiathèque, avec titre, texte alternatif, légende |
 | `wp_redirection_preparer` | créer une règle de l'extension Redirection (301, 302, 307, 308) |
 | `wp_redirection_activer_preparer` | activer ou désactiver des règles (jamais de suppression) |
@@ -90,8 +93,8 @@ Variables d'environnement :
 Verrous (`writes.py`, `client.py`) :
 1. `WP_ENABLE_WRITES=1` obligatoire, sinon même la préparation est refusée.
 2. Jeton aléatoire, à usage unique, valable 10 minutes ; l'écriture exécutée est exactement celle de l'aperçu.
-3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, contenu Elementor d'une page ou d'un article existant, envoi d'un média et de ses textes, création et activation de redirections, vidage du cache Elementor. Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
-4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, empreinte du contenu, empreinte du fichier), l'écriture est refusée.
+3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, contenu, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, modification d'une entrée de menu existante, création et activation de redirections, vidage du cache Elementor. Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
+4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, statut, empreinte du contenu, de l'entrée de menu, des textes d'une image ou du fichier), l'écriture est refusée.
 5. Avant toute modification d'un contenu Elementor : sauvegarde JSON dans `WP_BACKUP_DIR` ; après : relecture et comparaison. Journal `journal.jsonl` (date, opération, identifiants, issue — jamais le contenu).
 
 Remplacer un PDF en ligne : WordPress donne une nouvelle adresse à chaque envoi ; envoyer le nouveau fichier puis mettre à jour les liens avec `wp_widget_texte_preparer`.

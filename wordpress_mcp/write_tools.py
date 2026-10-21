@@ -1,8 +1,9 @@
 """Outils d'écriture (v2) : préparer → aperçu → confirmer. Voir writes.py pour les verrous.
 
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
-wp_media_envoyer_preparer, wp_redirection_preparer, wp_redirection_activer_preparer,
-wp_ecriture_confirmer, wp_ecriture_annuler, wp_ecritures_en_attente.
+wp_page_preparer, wp_menu_entree_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
+wp_redirection_preparer, wp_redirection_activer_preparer, wp_ecriture_confirmer,
+wp_ecriture_annuler, wp_ecritures_en_attente.
 
 Chaque *_preparer ne fait que des lectures ; l'écriture n'a lieu que dans un exécuteur
 (`EXECUTORS`), appelé par wp_ecriture_confirmer avec un jeton valide.
@@ -59,6 +60,29 @@ def _as_html(contenu: str) -> str:
 def _short(text: str, limit: int = 600) -> str:
     text = text or ""
     return text if len(text) <= limit else text[:limit] + f"… ({len(text)} caractères)"
+
+
+_SPACES = r"(?:\s|&nbsp;|&#160;|\xa0)+"
+
+
+def find_excerpt(haystack: str, needle: str) -> list[tuple[int, int]]:
+    """Positions de `needle` dans `haystack`, en tolérant les variantes d'espaces (insécables,
+    &nbsp;) et d'apostrophes (' ’). Le texte cherché ne doit pas traverser une balise HTML."""
+    tokens = [t for t in re.split(r"\s+", (needle or "").strip()) if t]
+    if not tokens:
+        return []
+    def tok(t: str) -> str:
+        return re.sub(r"\\?['’]", "['’]", re.escape(t))
+    pattern = _SPACES.join(tok(t) for t in tokens)
+    return [m.span() for m in re.finditer(pattern, haystack)]
+
+
+def _context(text: str, start: int, end: int, width: int = 90) -> str:
+    left = E.html_to_text(text[max(0, start - width * 3):start])[-width:]
+    right = E.html_to_text(text[end:end + width * 3])[:width]
+    sep_l = " " if start > 0 and (text[start - 1].isspace() or text[start - 1] == "\xa0") else ""
+    sep_r = " " if end < len(text) and (text[end].isspace() or text[end] == "\xa0") else ""
+    return f"…{left}{sep_l}[[{E.html_to_text(text[start:end])}]]{sep_r}{right}…"
 
 
 def _stale_error(what: str) -> WordPressError:
@@ -224,13 +248,16 @@ async def _write_elementor(client: WordPressClient, path: str, new_raw: str, con
 
 @mcp.tool()
 async def wp_widget_texte_preparer(id: int, widget_id: str, champ: str, nouveau_texte: str,
-                                   type_contenu: str = "page") -> dict[str, Any]:
+                                   type_contenu: str = "page", remplacer: str | None = None) -> dict[str, Any]:
     """PRÉPARE le remplacement du texte d'un widget Elementor d'une page (ou d'un article) ; n'écrit
     rien. Repérer `widget_id` et `champ` avec wp_contenu_lire(format='elementor') : `champ` = clé du
     réglage (`title`, `editor`, `text`…) ou chemin dans une liste (`icon_list.2.text`, index à partir
     de 0). Champ HTML (`editor`…) : `nouveau_texte` en HTML, ou texte brut converti en paragraphes.
-    Sur une page publiée, la modification est en ligne dès la confirmation ; l'ancien contenu est
-    sauvegardé localement (restaurable avec wp_page_restaurer_preparer)."""
+    Remplacement ciblé : avec `remplacer` (extrait exact du texte actuel, présent une seule fois),
+    seul cet extrait est remplacé par `nouveau_texte` (inséré tel quel, mise en forme du reste
+    conservée) — à préférer pour corriger une phrase dans un long bloc. `nouveau_texte` vide
+    supprime l'extrait. Sur une page publiée, la modification est en ligne dès la confirmation ;
+    l'ancien contenu est sauvegardé localement (restaurable avec wp_page_restaurer_preparer)."""
     gate = _get_gate()
     gate.ensure_enabled()
     client = _get_client()
@@ -245,7 +272,21 @@ async def wp_widget_texte_preparer(id: int, widget_id: str, champ: str, nouveau_
         raise WordPressError(str(e), code="champ_introuvable") from e
     if not isinstance(old, str):
         raise WordPressError(f"le champ {champ} n'est pas un texte", code="champ_introuvable")
-    new = _as_html(nouveau_texte) if E.is_html_field(champ) else nouveau_texte
+    context_before = context_after = None
+    if remplacer is not None:
+        spans = find_excerpt(old, remplacer)
+        if len(spans) != 1:
+            hint = (" — il figure dans le texte affiché mais traverse une mise en forme (gras, lien…) : "
+                    "choisir un extrait plus court" if not spans and find_excerpt(E.html_to_text(old), remplacer)
+                    else "")
+            raise WordPressError(f"extrait trouvé {len(spans)} fois dans {champ} (il doit l'être exactement une "
+                                 f"fois){hint}", code="extrait_introuvable" if not spans else "extrait_ambigu")
+        start, end = spans[0]
+        new = old[:start] + nouveau_texte + old[end:]
+        context_before = _context(old, start, end)
+        context_after = _context(new, start, start + len(nouveau_texte))
+    else:
+        new = _as_html(nouveau_texte) if E.is_html_field(champ) else nouveau_texte
     if new == old:
         raise WordPressError("aucun changement : le texte est déjà celui-ci", code="aucun_changement")
     new_tree = copy.deepcopy(tree)
@@ -263,7 +304,10 @@ async def wp_widget_texte_preparer(id: int, widget_id: str, champ: str, nouveau_
     preview = {"contenu": f"{type_contenu} {id} « {_raw(item.get('title'))} »", "lien": item.get("link"),
                "widget": f"{el.get('widgetType')} #{widget_id}", "champ": champ,
                "avant": _short(E.html_to_text(old)), "apres": _short(E.html_to_text(new))}
-    if E.is_html_field(champ):
+    if context_before is not None:
+        preview["avant"], preview["apres"] = context_before, context_after
+        preview["mode"] = "remplacement ciblé (le reste du bloc est inchangé)"
+    elif E.is_html_field(champ):
         preview["apres_html"] = _short(new, 1500)
     return gate.prepare("widget_texte", {"path": path, "new_raw": new_raw, "new_content": new_content,
                                          "widget_id": widget_id, "champ": champ},
@@ -501,6 +545,184 @@ async def _exec_redirection_activer(client: WordPressClient, gate: WriteGate, p:
     return {"regles": [{"id": i, "active": v} for i, v in state.items()]}
 
 
+# ======================================================================= pages : titre et statut
+PAGE_STATUSES = {"publish": "publié", "draft": "brouillon", "private": "privé", "pending": "en attente de relecture"}
+
+
+async def _menus_pointing_to(client: WordPressClient, item_id: int) -> list[str]:
+    try:
+        menus = {m["id"]: html.unescape(m.get("name", "")) for m in await client.get_all("/wp/v2/menus")}
+        items = await client.get_all("/wp/v2/menu-items", {"context": "edit"})
+    except WordPressError:
+        return []
+    return [f"{menus.get(i.get('menus'), i.get('menus'))} › {html.unescape(_raw(i.get('title')))}"
+            for i in items if i.get("object_id") == item_id and i.get("type") == "post_type"
+            and i.get("status") == "publish"]
+
+
+@mcp.tool()
+async def wp_page_preparer(id: int, titre: str | None = None, statut: str | None = None,
+                           type_contenu: str = "page") -> dict[str, Any]:
+    """PRÉPARE le changement du titre et/ou du statut d'une page (ou d'un article) existante ;
+    n'écrit rien. `statut` : draft (brouillon : la page n'est plus visible, rien n'est supprimé),
+    private, pending, publish. Signale les entrées de menu qui pointent vers la page."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    path = _content_path(type_contenu, id)
+    if titre is None and statut is None:
+        raise WordPressError("indiquer `titre` et/ou `statut`", code="parametre")
+    if statut is not None and statut not in PAGE_STATUSES:
+        raise WordPressError(f"statut inconnu : {statut} ({', '.join(PAGE_STATUSES)})", code="parametre")
+    cur = await client.get(path, {"context": "edit"})
+    payload: dict[str, Any] = {}
+    changes: dict[str, Any] = {}
+    if titre is not None and titre.strip() != _raw(cur.get("title")):
+        payload["title"] = titre.strip()
+        changes["titre"] = {"avant": _raw(cur.get("title")), "apres": titre.strip()}
+    if statut is not None and statut != cur.get("status"):
+        payload["status"] = statut
+        changes["statut"] = {"avant": PAGE_STATUSES.get(cur.get("status"), cur.get("status")),
+                             "apres": PAGE_STATUSES[statut]}
+    if not payload:
+        raise WordPressError("aucun changement", code="aucun_changement")
+    warnings = []
+    if cur.get("status") == "publish" and statut and statut != "publish":
+        menus = await _menus_pointing_to(client, int(id))
+        warnings.append("La page ne sera plus visible du public ; ses liens renverront une erreur 404.")
+        if menus:
+            warnings.append("Entrées de menu qui pointent vers elle (WordPress les masque) : " + " ; ".join(menus))
+    if statut == "publish" and cur.get("status") != "publish":
+        warnings.append("La page sera VISIBLE IMMÉDIATEMENT sur le site public.")
+    preview = {"contenu": f"{type_contenu} {id}", "lien": cur.get("link"), "changements": changes}
+    return gate.prepare("page", {"path": path, "payload": payload},
+                        summary=f"Modifier {type_contenu} {id} « {_raw(cur.get('title'))} » ({', '.join(changes)})",
+                        preview=preview, guard={"modified": cur.get("modified"),
+                                                "status": cur.get("status")}, warnings=warnings)
+
+
+async def _exec_page(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    path = p.args["path"]
+    cur = await client.get(path, {"context": "edit"})
+    if cur.get("modified") != p.guard.get("modified") or cur.get("status") != p.guard.get("status"):
+        raise _stale_error("Le contenu")
+    data = await client.write("POST", path, json=p.args["payload"])
+    gate.journal("page", True, chemin=path, champs=sorted(p.args["payload"]))
+    return {"id": data.get("id"), "titre": _raw(data.get("title")),
+            "statut": PAGE_STATUSES.get(data.get("status"), data.get("status")), "lien": data.get("link")}
+
+
+# ======================================================================= menus
+def _item_view(it: dict[str, Any]) -> dict[str, Any]:
+    return {"libelle": html.unescape(_raw(it.get("title"))), "lien": it.get("url"),
+            "type": it.get("type"), "page_id": it.get("object_id") if it.get("type") == "post_type" else None,
+            "visible": it.get("status") == "publish"}
+
+
+@mcp.tool()
+async def wp_menu_entree_preparer(id: int, libelle: str | None = None, page_id: int | None = None,
+                                  url: str | None = None, masquer: bool | None = None) -> dict[str, Any]:
+    """PRÉPARE la modification d'une entrée de menu existante (id : voir wp_menus) ; n'écrit rien.
+    `page_id` : faire pointer l'entrée vers une autre page publiée ; `url` : lien personnalisé
+    (https://… ou chemin du site) ; `libelle` : texte affiché ; `masquer=True` : l'entrée n'est plus
+    affichée (passée en brouillon, réversible avec `masquer=False`). Aucune entrée n'est supprimée."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    if page_id is not None and url is not None:
+        raise WordPressError("choisir `page_id` OU `url`", code="parametre")
+    cur = await client.get(f"/wp/v2/menu-items/{int(id)}", {"context": "edit"})
+    before = _item_view(cur)
+    payload: dict[str, Any] = {}
+    if libelle is not None and libelle.strip() != before["libelle"]:
+        payload["title"] = libelle.strip()
+    if page_id is not None:
+        page = await client.get(f"/wp/v2/pages/{int(page_id)}")
+        if page.get("status") != "publish":
+            raise WordPressError(f"la page {page_id} n'est pas publiée", code="parametre")
+        payload.update({"type": "post_type", "object": "page", "object_id": int(page_id)})
+        after_link = page.get("link")
+    elif url is not None:
+        u = url.strip()
+        if not u.startswith("https://"):
+            u = client.settings.base_url.rstrip("/") + _site_path(client, u, "url")
+        payload.update({"type": "custom", "url": u})
+        after_link = u
+    else:
+        after_link = before["lien"]
+    if masquer is not None and masquer == before["visible"]:
+        payload["status"] = "draft" if masquer else "publish"
+    if not payload:
+        raise WordPressError("aucun changement", code="aucun_changement")
+    after = {"libelle": payload.get("title", before["libelle"]), "lien": after_link,
+             "visible": (payload.get("status", cur.get("status")) == "publish")}
+    preview = {"entree": int(id), "avant": before, "apres": after}
+    warnings = ["Le menu change dès la confirmation, sur toutes les pages du site."]
+    return gate.prepare("menu_entree", {"id": int(id), "payload": payload},
+                        summary=f"Modifier l'entrée de menu « {before['libelle']} » ({int(id)})",
+                        preview=preview, guard={"fp": fingerprint(_item_view(cur))}, warnings=warnings)
+
+
+async def _exec_menu_entree(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    path = f"/wp/v2/menu-items/{p.args['id']}"
+    cur = await client.get(path, {"context": "edit"})
+    if fingerprint(_item_view(cur)) != p.guard.get("fp"):
+        raise _stale_error("L'entrée de menu")
+    data = await client.write("POST", path, json=p.args["payload"])
+    gate.journal("menu_entree", True, id=p.args["id"], champs=sorted(p.args["payload"]))
+    return {"entree": _item_view(data)}
+
+
+# ======================================================================= textes alternatifs
+@mcp.tool()
+async def wp_medias_alt_preparer(elements: list[dict[str, Any]]) -> dict[str, Any]:
+    """PRÉPARE la mise à jour des textes alternatifs (et, si fournis, titre ou légende) d'images de
+    la médiathèque ; n'écrit rien. `elements` : liste (50 au plus) de
+    {"id": 123, "texte_alternatif": "…", "titre": "…" (facultatif), "legende": "…" (facultatif)}.
+    Le texte alternatif décrit l'image pour les personnes aveugles ; vide = image décorative."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    if not elements or len(elements) > 50:
+        raise WordPressError("de 1 à 50 éléments", code="parametre")
+    plan, rows, guard = [], [], {}
+    for e in elements:
+        mid = int(e.get("id"))
+        media = await client.get(f"/wp/v2/media/{mid}", {"context": "edit"})
+        if not str(media.get("mime_type", "")).startswith("image/"):
+            raise WordPressError(f"le média {mid} n'est pas une image", code="parametre")
+        payload = {}
+        for key, field in (("texte_alternatif", "alt_text"), ("titre", "title"), ("legende", "caption")):
+            if key in e and e[key] is not None:
+                current = media.get(field) if field == "alt_text" else _raw(media.get(field))
+                if str(e[key]).strip() != (current or ""):
+                    payload[field] = str(e[key]).strip()
+        if payload:
+            plan.append({"id": mid, "payload": payload})
+            guard[str(mid)] = fingerprint([media.get("alt_text"), _raw(media.get("title")), _raw(media.get("caption"))])
+            rows.append({"id": mid, "fichier": (media.get("media_details") or {}).get("file") or media.get("source_url"),
+                         "avant": media.get("alt_text") or "", "apres": payload.get("alt_text", media.get("alt_text") or ""),
+                         **({"titre": payload["title"]} if "title" in payload else {})})
+    if not plan:
+        raise WordPressError("aucun changement", code="aucun_changement")
+    return gate.prepare("medias_alt", {"plan": plan},
+                        summary=f"Mettre à jour le texte alternatif de {len(plan)} image(s)",
+                        preview={"images": rows}, guard=guard)
+
+
+async def _exec_medias_alt(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    for step in p.args["plan"]:
+        media = await client.get(f"/wp/v2/media/{step['id']}", {"context": "edit"})
+        if fingerprint([media.get("alt_text"), _raw(media.get("title")), _raw(media.get("caption"))]) != p.guard.get(str(step["id"])):
+            raise _stale_error(f"L'image {step['id']}")
+    done = []
+    for step in p.args["plan"]:
+        data = await client.write("POST", f"/wp/v2/media/{step['id']}", json=step["payload"])
+        done.append({"id": data.get("id"), "texte_alternatif": data.get("alt_text")})
+    gate.journal("medias_alt", True, ids=[s["id"] for s in p.args["plan"]])
+    return {"images": done}
+
+
 # ======================================================================= confirmation
 EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaitable[dict[str, Any]]]] = {
     "article": _exec_article,
@@ -509,6 +731,9 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "media_envoyer": _exec_media_envoyer,
     "redirection": _exec_redirection,
     "redirection_activer": _exec_redirection_activer,
+    "page": _exec_page,
+    "menu_entree": _exec_menu_entree,
+    "medias_alt": _exec_medias_alt,
 }
 
 

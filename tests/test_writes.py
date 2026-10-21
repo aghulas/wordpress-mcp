@@ -40,7 +40,7 @@ def _writes():
                                          ("POST", "/wp/v2/pages/644"), ("POST", "/wp/v2/media"),
                                          ("POST", "/wp/v2/media/9"), ("POST", "/redirection/v1/redirect"),
                                          ("POST", "/redirection/v1/bulk/redirect/disable"),
-                                         ("DELETE", "/elementor/v1/cache")])
+                                         ("DELETE", "/elementor/v1/cache"), ("POST", "/wp/v2/menu-items/765")])
 def test_allowed_writes(method, path):
     check_write_allowed(method, path)
 
@@ -50,7 +50,9 @@ def test_allowed_writes(method, path):
                                          ("POST", "/wp/v2/settings"), ("PUT", "/wp/v2/pages/644"),
                                          ("POST", "/redirection/v1/bulk/redirect/delete"),
                                          ("POST", "/wp/v2/pages"), ("POST", "/wp/v2/posts/12/../../users"),
-                                         ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x")])
+                                         ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x"),
+                                         ("DELETE", "/wp/v2/menu-items/765"), ("POST", "/wp/v2/menu-items"),
+                                         ("POST", "/wp/v2/menus/5")])
 def test_refused_writes(method, path):
     with pytest.raises(WordPressError) as e:
         check_write_allowed(method, path)
@@ -331,3 +333,112 @@ async def test_cancel_and_pending(writes_on):
     assert (await WT.wp_ecritures_en_attente())["en_attente"][0]["jeton"] == prep["jeton"]
     assert (await WT.wp_ecriture_annuler(prep["jeton"]))["annule"] is True
     assert (await WT.wp_ecritures_en_attente())["en_attente"] == []
+
+
+# ------------------------------------------------------------------ v0.3 : remplacement ciblé
+LONG = ("<p>Une organisation est à respecter, en particulier le protocole sanitaire en vigueur.</p>"
+        "<ul><li>L\u2019entrée est limitée à un seul parent.</li><li>En respectant les règles de\u00a0distanciation.</li></ul>"
+        "<p>Pénalité : <strong>5 €</strong> le quart d\u2019heure.</p>")
+
+
+def test_find_excerpt_tolerant():
+    assert len(WT.find_excerpt(LONG, "règles de distanciation")) == 1
+    assert len(WT.find_excerpt(LONG, "L'entrée est limitée")) == 1          # apostrophe droite vs typographique
+    assert WT.find_excerpt(LONG, "Pénalité : 5 €") == []                    # traverse <strong>
+    assert len(WT.find_excerpt(LONG, "le")) > 1
+
+
+@respx.mock
+async def test_widget_targeted_replace_keeps_rest(writes_on):
+    tree = json.loads(ELEMENTOR_DATA)
+    tree[0]["elements"][0]["elements"][1]["settings"]["editor"] = LONG
+    page = FakePage(raw=json.dumps(tree), content=LONG)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.get)
+    respx.post(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=page.post)
+    respx.delete(f"{BASE}/wp-json/elementor/v1/cache").mock(return_value=httpx.Response(200, json=True))
+    prep = await WT.wp_widget_texte_preparer(10, "w2", "editor", "", remplacer=", en particulier le protocole sanitaire en vigueur")
+    assert prep["apercu"]["mode"].startswith("remplacement ciblé")
+    assert "[[, en particulier le protocole sanitaire en vigueur]]" in prep["apercu"]["avant"]
+    await WT.wp_ecriture_confirmer(prep["jeton"])
+    new = json.loads(page.raw)[0]["elements"][0]["elements"][1]["settings"]["editor"]
+    assert new == LONG.replace(", en particulier le protocole sanitaire en vigueur", "")
+    assert "<strong>5 €</strong>" in new and "\u00a0distanciation" in new          # le reste est intact
+    assert page.content == new                                                      # texte de secours suivi
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_widget_texte_preparer(10, "w2", "editor", "15 €", remplacer="Pénalité : 5 €")
+    assert e.value.code == "extrait_introuvable" and "mise en forme" in str(e.value)
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_widget_texte_preparer(10, "w2", "editor", "x", remplacer="le")
+    assert e.value.code == "extrait_ambigu"
+    prep = await WT.wp_widget_texte_preparer(10, "w2", "editor", "15 €", remplacer="5 €")
+    assert "[[15 €]]" in prep["apercu"]["apres"]
+
+
+# ------------------------------------------------------------------ v0.3 : pages, menus, images
+PAGE734 = {"id": 734, "status": "publish", "link": f"{BASE}/tarification/", "modified": "2021-01-04T13:54:05",
+           "title": {"raw": "Tarifs &amp; inscription"}, "content": {"raw": ""}}
+MENU_ITEMS_V3 = [{"id": 765, "title": {"raw": "Tarifs &#038; inscription"}, "url": f"{BASE}/tarification",
+                  "status": "publish", "type": "post_type", "object": "page", "object_id": 734, "menus": 5}]
+
+
+@respx.mock
+async def test_page_to_draft_warns_about_menus(writes_on):
+    route = respx.get(f"{BASE}/wp-json/wp/v2/pages/734").mock(return_value=httpx.Response(200, json=PAGE734))
+    respx.get(f"{BASE}/wp-json/wp/v2/menus").mock(return_value=httpx.Response(200, json=[{"id": 5, "name": "Accès rapide"}]))
+    respx.get(f"{BASE}/wp-json/wp/v2/menu-items").mock(return_value=httpx.Response(200, json=MENU_ITEMS_V3))
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/734").mock(
+        return_value=httpx.Response(200, json={**PAGE734, "status": "draft"}))
+    prep = await WT.wp_page_preparer(734, statut="draft")
+    assert prep["apercu"]["changements"] == {"statut": {"avant": "publié", "apres": "brouillon"}}
+    assert any("Accès rapide › Tarifs & inscription" in w for w in prep["avertissements"])
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert json.loads(post.calls.last.request.content) == {"status": "draft"} and out["statut"] == "brouillon"
+    with pytest.raises(WordPressError):
+        await WT.wp_page_preparer(734, statut="trash")
+    prep = await WT.wp_page_preparer(734, titre="Mentions légales")
+    route.mock(return_value=httpx.Response(200, json={**PAGE734, "modified": "2026-10-21T21:00:00"}))
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and post.call_count == 1
+
+
+@respx.mock
+async def test_menu_entry_repoint_url_and_hide(writes_on):
+    item = dict(MENU_ITEMS_V3[0])
+    route = respx.get(f"{BASE}/wp-json/wp/v2/menu-items/765").mock(side_effect=lambda r: httpx.Response(200, json=item))
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/1043").mock(return_value=httpx.Response(200, json={
+        "id": 1043, "status": "publish", "link": f"{BASE}/tarifs/"}))
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/751").mock(return_value=httpx.Response(200, json={"id": 751, "status": "draft"}))
+    post = respx.post(f"{BASE}/wp-json/wp/v2/menu-items/765").mock(side_effect=lambda r: httpx.Response(200, json={**item, **json.loads(r.content)}))
+    prep = await WT.wp_menu_entree_preparer(765, page_id=1043)
+    assert prep["apercu"]["avant"]["libelle"] == "Tarifs & inscription" and prep["apercu"]["apres"]["lien"] == f"{BASE}/tarifs/"
+    await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert json.loads(post.calls.last.request.content) == {"type": "post_type", "object": "page", "object_id": 1043}
+    with pytest.raises(WordPressError):
+        await WT.wp_menu_entree_preparer(765, page_id=751)                     # page non publiée
+    prep = await WT.wp_menu_entree_preparer(765, url="/", libelle="Accueil")
+    assert json.dumps(prep["apercu"]["apres"]["lien"]) == json.dumps(BASE + "/")
+    prep2 = await WT.wp_menu_entree_preparer(765, masquer=True)
+    item["status"] = "draft"                                                   # modifiée entre-temps
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep2["jeton"])
+    assert e.value.code == "modifie_entre_temps"
+    with pytest.raises(WordPressError):
+        await WT.wp_menu_entree_preparer(765, url="javascript:alert(1)")
+
+
+@respx.mock
+async def test_media_alt_batch(writes_on):
+    medias = {55: {"id": 55, "mime_type": "image/jpeg", "alt_text": "", "title": {"raw": "img"}, "caption": {"raw": ""},
+                   "media_details": {"file": "2021/05/kermesse.jpg"}},
+              56: {"id": 56, "mime_type": "application/pdf", "alt_text": "", "title": {"raw": "doc"}, "caption": {"raw": ""}}}
+    for mid, m in medias.items():
+        respx.get(f"{BASE}/wp-json/wp/v2/media/{mid}").mock(return_value=httpx.Response(200, json=m))
+    post = respx.post(f"{BASE}/wp-json/wp/v2/media/55").mock(return_value=httpx.Response(200, json={"id": 55, "alt_text": "Élèves à la kermesse"}))
+    with pytest.raises(WordPressError):
+        await WT.wp_medias_alt_preparer([{"id": 56, "texte_alternatif": "x"}])
+    prep = await WT.wp_medias_alt_preparer([{"id": 55, "texte_alternatif": "Élèves à la kermesse"}])
+    assert prep["apercu"]["images"][0]["fichier"] == "2021/05/kermesse.jpg" and not post.called
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert json.loads(post.calls.last.request.content) == {"alt_text": "Élèves à la kermesse"}
+    assert out["images"] == [{"id": 55, "texte_alternatif": "Élèves à la kermesse"}]

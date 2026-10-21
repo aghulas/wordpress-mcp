@@ -59,6 +59,7 @@ ALLOWED_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/wp/v2/pages/\d+$")),                          # texte Elementor d'une page
     ("POST", re.compile(r"^/wp/v2/media$")),                              # envoyer un fichier
     ("POST", re.compile(r"^/wp/v2/media/\d+$")),                          # titre / alt / légende du fichier
+    ("POST", re.compile(r"^/wp/v2/menu-items/\d+$")),                     # entrée de menu (lien, libellé, masquer)
     ("POST", re.compile(r"^/redirection/v1/redirect$")),                  # créer une redirection
     ("POST", re.compile(r"^/redirection/v1/bulk/redirect/(enable|disable)$")),  # activer / désactiver
     ("DELETE", re.compile(r"^/elementor/v1/cache$")),                     # vider le cache Elementor
@@ -132,7 +133,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.2",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.3",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -272,7 +273,7 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.2"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.3"}) as http:
             resp = await http.get(url)
         if resp.status_code >= 400:
             raise WordPressError(f"HTTP {resp.status_code}", status=resp.status_code)
