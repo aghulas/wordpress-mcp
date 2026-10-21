@@ -19,7 +19,7 @@ TEXT_KEYS: tuple[str, ...] = (
     "rotating_text", "testimonial_content", "testimonial_name", "testimonial_job", "tab_title",
     "tab_content", "item_title", "item_description", "field_label", "email_subject",
     "success_message", "error_message", "required_field_message", "invalid_message",
-    "form_name", "address", "title_size", "link_text", "image_alt", "alt",
+    "form_name", "address", "title_size", "link_text", "image_alt", "alt", "shortcode",
 )
 LINK_KEYS: tuple[str, ...] = ("link", "button_link", "image_link", "url")
 LIST_KEYS: tuple[str, ...] = (
@@ -27,6 +27,19 @@ LIST_KEYS: tuple[str, ...] = (
     "price_list", "testimonials", "carousel", "gallery", "hotspot", "table_rows", "steps",
     "features", "cards", "accordion",
 )
+
+# Widgets qui affichent une liste de contenus calculée à l'affichage (pas de texte en dur) :
+# on décrit leur requête à la place.
+DYNAMIC_WIDGETS: dict[str, str] = {
+    "posts": "liste d'articles",
+    "archive-posts": "archive d'articles",
+    "portfolio": "portfolio",
+    "loop-grid": "grille de contenus",
+    "loop-carousel": "carrousel de contenus",
+    "wpr-grid": "grille de contenus (Royal Addons)",
+    "wpr-magazine-grid": "grille magazine (Royal Addons)",
+    "wpr-posts-timeline": "frise d'articles (Royal Addons)",
+}
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"[ \t\r\f\v]+")
@@ -88,6 +101,43 @@ def _settings_text(settings: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _first(settings: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        v = settings.get(key)
+        if v not in (None, "", [], {}):
+            return v
+    return None
+
+
+def dynamic_query(widget_type: str | None, settings: dict[str, Any]) -> dict[str, Any] | None:
+    """Description lisible de la requête d'un widget de liste dynamique (articles, boucle…)."""
+    label = DYNAMIC_WIDGETS.get(widget_type or "")
+    if not label:
+        return None
+    skin = settings.get("_skin") or "classic"
+    out: dict[str, Any] = {"contenu": label}
+    out["source"] = _first(settings, "posts_post_type", "post_query_post_type", "query_source",
+                           "query_post_type") or "post"
+    nombre = _first(settings, f"{skin}_posts_per_page", "posts_per_page", "post_query_posts_per_page",
+                    "query_posts_per_page")
+    if nombre is not None:
+        out["nombre"] = nombre
+    termes = _first(settings, "posts_include_term_ids", "post_query_include_term_ids",
+                    "query_selection_categories", "query_taxonomy_category")
+    if termes:
+        out["termes"] = termes
+    ids = _first(settings, "posts_posts_ids", "post_query_posts_ids", "query_manual_post")
+    if ids:
+        out["contenus_choisis"] = ids
+    suite = _first(settings, f"{skin}_read_more_text", "read_more_text", "read_more_text_custom")
+    if isinstance(suite, str) and suite.strip():
+        out["lien_suite"] = html_to_text(suite)
+    modele = _first(settings, "template_id")
+    if modele:
+        out["modele"] = modele
+    return out
+
+
 def parse_elementor_data(raw: Any) -> list[dict[str, Any]]:
     """`_elementor_data` (chaîne JSON ou liste déjà décodée) → liste d'éléments racine."""
     if raw is None or raw == "":
@@ -119,7 +169,11 @@ def extract_widgets(raw: Any) -> list[dict[str, Any]]:
     for el, depth in walk(parse_elementor_data(raw)):
         if el.get("elType") != "widget":
             continue
-        fields = _settings_text(el.get("settings") or {})
+        settings = el.get("settings") or {}
+        fields = _settings_text(settings)
+        query = dynamic_query(el.get("widgetType"), settings)
+        if query:
+            fields["requete"] = query
         if not fields:
             continue
         out.append({
@@ -152,8 +206,10 @@ def widgets_to_text(widgets: list[dict[str, Any]]) -> str:
             if isinstance(val, list):
                 for row in val:
                     lines.append(f"{indent}  - " + " | ".join(f"{k}: {v}" for k, v in row.items() if not isinstance(v, (list, dict))))
-            elif isinstance(val, dict):
+            elif isinstance(val, dict) and "url" in val:
                 lines.append(f"{indent}  {key}: {val.get('url')}")
+            elif isinstance(val, dict):
+                lines.append(f"{indent}  {key}: " + ", ".join(f"{k}={v}" for k, v in val.items()))
             else:
                 lines.append(f"{indent}  {key}: {val}")
     return "\n".join(lines)
