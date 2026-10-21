@@ -278,7 +278,64 @@ async def test_utilisateurs_and_revisions():
 async def test_tool_count():
     tools = await S.mcp.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 16
+    assert len(tools) == 17
     assert all(n.startswith("wp_") for n in names)
     # Aucun outil d'écriture ne doit exister dans cette version.
     assert not any(k in n for n in names for k in ("prepare", "confirm", "create", "update", "delete", "upload"))
+
+
+def _health(status, label, actions=""):
+    return httpx.Response(200, json={"label": label, "status": status, "badge": {"label": "Sécurité"},
+                                     "description": f"<p>{label}</p>", "actions": actions, "test": "x"})
+
+
+@respx.mock
+async def test_sante(monkeypatch, fake_client):
+    import dataclasses
+    from wordpress_mcp import wporg as W
+    fake_client.settings = dataclasses.replace(fake_client.settings, auth_header="X-Claude-Auth")
+    for name in S.HEALTH_TESTS:
+        respx.get(f"{BASE}/wp-json/wp-site-health/v1/tests/{name}").mock(return_value=_health("good", f"OK {name}"))
+    respx.get(f"{BASE}/wp-json/wp-site-health/v1/tests/authorization-header").mock(
+        return_value=_health("recommended", "L'entête d'autorisation est invalide.", "<p><a href='x'>Regénérer</a></p>"))
+    respx.get(f"{BASE}/wp-json/wp-site-health/v1/tests/page-cache").mock(
+        return_value=httpx.Response(500, json={"code": "boom", "message": "Erreur"}))
+    G = 1024 ** 3
+    respx.get(f"{BASE}/wp-json/wp-site-health/v1/directory-sizes").mock(return_value=httpx.Response(200, json={
+        "wordpress_size": {"size": "4 Go", "raw": 4 * G}, "themes_size": {"size": "0,5 Go", "raw": G // 2},
+        "plugins_size": {"size": "0,5 Go", "raw": G // 2}, "uploads_size": {"size": "1 Go", "raw": G},
+        "database_size": {"size": "50 Mo", "raw": 50 * 1024 ** 2}, "total_size": {"size": "4,05 Go", "raw": 0}}))
+    respx.get(f"{BASE}/wp-json/wp/v2/plugins").mock(return_value=httpx.Response(200, json=[
+        {"plugin": "elementor/elementor", "name": "Elementor", "version": "4.3.5", "status": "active"},
+        {"plugin": "elementor-pro/elementor-pro", "name": "Elementor Pro", "version": "4.2.3", "status": "active"},
+    ]))
+    respx.get(f"{BASE}/wp-json/wp/v2/themes").mock(return_value=httpx.Response(200, json=[
+        {"stylesheet": "ashe-pro", "name": {"rendered": "Ashe Pro"}, "version": "3.9", "status": "active"}]))
+    respx.get(f"{BASE}/feed/").mock(return_value=httpx.Response(
+        200, text="<rss><generator>https://wordpress.org/?v=7.1.2</generator></rss>"))
+
+    async def fake_latest(self, plugins, themes):
+        assert sorted(plugins) == ["elementor", "elementor-pro"] and themes == ["ashe-pro"]
+        return {"core": "7.1.3", "plugins": {"elementor": "4.4.0", "elementor-pro": None}, "themes": {"ashe-pro": None}}
+    monkeypatch.setattr(W.WordPressOrg, "latest_versions", fake_latest)
+
+    out = await S.wp_sante()
+    assert out["resume"] == {"bon": 4, "recommandé": 1, "échec": 1}
+    auth = next(t for t in out["tests"] if t["test"] == "authorization-header")
+    assert auth["actions"] == "Regénérer" and "X-Claude-Auth" in auth["note"]
+    assert out["tailles"]["autres_dans_wordpress"] == "2,00 Go" and out["tailles"]["base_de_donnees"] == "50 Mo"
+    v = out["versions"]
+    assert v["wordpress"] == {"installee": "7.1.2", "derniere": "7.1.3", "mise_a_jour": True}
+    assert v["a_mettre_a_jour"] == ["WordPress 7.1.2 → 7.1.3", "Elementor 4.3.5 → 4.4.0"]
+    assert v["hors_wordpress_org"] == ["Elementor Pro", "Ashe Pro"] and "note_hors_wordpress_org" in v
+
+
+@respx.mock
+async def test_sante_sans_mises_a_jour_ni_wordpress_org(monkeypatch):
+    for name in S.HEALTH_TESTS:
+        respx.get(f"{BASE}/wp-json/wp-site-health/v1/tests/{name}").mock(return_value=_health("good", "OK"))
+    respx.get(f"{BASE}/wp-json/wp-site-health/v1/directory-sizes").mock(
+        return_value=httpx.Response(403, json={"code": "rest_forbidden", "message": "Interdit"}))
+    out = await S.wp_sante(mises_a_jour=False)
+    assert out["resume"] == {"bon": 6} and "versions" not in out and "erreur" in out["tailles"]
+

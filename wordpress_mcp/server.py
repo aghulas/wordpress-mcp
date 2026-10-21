@@ -3,7 +3,7 @@
 Outils :
   wp_statut, wp_reglages, wp_arborescence, wp_pages_list, wp_articles_list, wp_contenu_lire,
   wp_revisions, wp_recherche, wp_medias_list, wp_menus, wp_categories, wp_evenements,
-  wp_formulaires_soumissions, wp_redirections, wp_extensions, wp_utilisateurs
+  wp_formulaires_soumissions, wp_redirections, wp_extensions, wp_utilisateurs, wp_sante
 
 Aucune écriture : seule la méthode GET est autorisée par le client (voir client.py). Les mots de
 passe d'application ne sont jamais renvoyés ni journalisés.
@@ -19,6 +19,7 @@ from mcp.server.mcpserver import MCPServer
 
 from . import elementor as E
 from . import mec as M
+from . import wporg as W
 from .client import WordPressClient, WordPressError
 
 log = logging.getLogger("wordpress_mcp.server")
@@ -30,7 +31,7 @@ mcp = MCPServer(
         "Accès en LECTURE SEULE au site WordPress configuré (WP_BASE_URL) via son API REST, avec un "
         "mot de passe d'application. Ce connecteur ne crée, ne modifie et ne supprime rien : il sert à "
         "relire le contenu (pages, articles, médias, menus, événements), à retrouver un texte, à auditer "
-        "le site (extensions, redirections, 404, soumissions de formulaires) et à préparer des mises à jour "
+        "le site (santé, mises à jour, extensions, redirections, 404, soumissions de formulaires) et à préparer des mises à jour "
         "que l'utilisateur fera ensuite lui-même dans wp-admin. Les pages construites avec Elementor sont "
         "lues widget par widget (wp_contenu_lire, format 'elementor'). Commencer par wp_statut pour "
         "vérifier la connexion et les droits ; sans identifiants, seul le contenu publié est visible."
@@ -590,3 +591,114 @@ async def wp_utilisateurs() -> list[dict[str, Any]]:
     users = await client.get_all("/wp/v2/users", {"context": "edit", "orderby": "registered_date", "order": "asc"})
     return [{"id": u.get("id"), "login": u.get("username"), "nom": u.get("name"), "roles": u.get("roles"),
              "inscrit": u.get("registered_date")} for u in users]
+
+
+HEALTH_TESTS = ("background-updates", "loopback-requests", "https-status", "dotorg-communication",
+                "authorization-header", "page-cache")
+HEALTH_STATUS = {"good": "bon", "recommended": "recommandé", "critical": "critique"}
+SIZE_KEYS = {"wordpress_size": "wordpress", "themes_size": "themes", "plugins_size": "extensions",
+             "uploads_size": "medias", "database_size": "base_de_donnees", "total_size": "total"}
+
+
+def _human_size(n: int) -> str:
+    for unit, factor in (("Go", 1024 ** 3), ("Mo", 1024 ** 2), ("Ko", 1024)):
+        if n >= factor:
+            return f"{n / factor:.2f} {unit}".replace(".", ",")
+    return f"{n} o"
+
+
+async def _health_test(client: WordPressClient, name: str) -> dict[str, Any]:
+    try:
+        t = await client.get(f"/wp-site-health/v1/tests/{name}")
+    except WordPressError as e:
+        return {"test": name, "statut": "échec", "erreur": str(e)}
+    out = {"test": name, "statut": HEALTH_STATUS.get(t.get("status"), t.get("status")),
+           "intitule": E.html_to_text(t.get("label")), "categorie": (t.get("badge") or {}).get("label"),
+           "description": E.html_to_text(t.get("description"))}
+    actions = E.html_to_text(t.get("actions"))
+    if actions:
+        out["actions"] = actions
+    if name == "authorization-header" and t.get("status") != "good" and client.settings.auth_header:
+        out["note"] = (f"attendu : l'hébergeur retire l'en-tête Authorization ; le connecteur passe par "
+                       f"{client.settings.auth_header} (snippet WPCode)")
+    return out
+
+
+async def _directory_sizes(client: WordPressClient) -> dict[str, Any]:
+    try:
+        d = await client.get("/wp-site-health/v1/directory-sizes")
+    except WordPressError as e:
+        return {"erreur": str(e)}
+    out: dict[str, Any] = {label: (d.get(key) or {}).get("size") for key, label in SIZE_KEYS.items()}
+    raw = {label: (d.get(key) or {}).get("raw") for key, label in SIZE_KEYS.items()}
+    parts = [raw.get(k) for k in ("wordpress", "themes", "extensions", "medias")]
+    if all(isinstance(v, int) for v in parts):
+        reste = parts[0] - sum(parts[1:])
+        if reste > 0:
+            out["autres_dans_wordpress"] = _human_size(reste)
+            out["note"] = ("« autres_dans_wordpress » : cœur WordPress et autres dossiers de wp-content "
+                           "(sauvegardes, cache, journaux…)")
+    return out
+
+
+async def _versions(client: WordPressClient) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    plugins = await client.get("/wp/v2/plugins")
+    themes = await client.get("/wp/v2/themes")
+    installed_core = None
+    try:
+        installed_core = W.version_from_feed(await client.get_public_page(
+            (client.settings.base_url or "").rstrip("/") + "/feed/"))
+    except WordPressError:
+        pass
+    try:
+        latest = await W.WordPressOrg(timeout=client.settings.timeout).latest_versions(
+            [W.plugin_slug(p.get("plugin")) or "" for p in plugins],
+            [W.theme_slug(t.get("stylesheet")) or "" for t in themes])
+    except Exception as e:  # wordpress.org injoignable : on donne au moins les versions installées
+        latest = {"core": None, "plugins": {}, "themes": {}}
+        out["note"] = f"wordpress.org injoignable ({type(e).__name__}) : dernières versions inconnues"
+    out["wordpress"] = {"installee": installed_core, "derniere": latest["core"],
+                        "mise_a_jour": W.is_outdated(installed_core, latest["core"])}
+
+    def row(kind: str, slug: str | None, ident: Any, name: Any, status: Any, version: Any) -> dict[str, Any]:
+        last = latest[kind].get(slug) if slug else None
+        known = bool(slug) and slug in latest[kind]
+        return {"id": ident, "nom": name, "statut": status, "version": version, "derniere": last,
+                "mise_a_jour": W.is_outdated(version, last),
+                "source": "wordpress.org" if last else ("hors wordpress.org" if known else "inconnue")}
+
+    out["extensions"] = [row("plugins", W.plugin_slug(p.get("plugin")), p.get("plugin"), p.get("name"),
+                             p.get("status"), p.get("version")) for p in plugins]
+    out["themes"] = [row("themes", W.theme_slug(t.get("stylesheet")), t.get("stylesheet"),
+                         _rendered(t.get("name")), t.get("status"), t.get("version")) for t in themes]
+    items = out["extensions"] + out["themes"]
+    out["a_mettre_a_jour"] = ([f"WordPress {installed_core} → {latest['core']}"]
+                              if out["wordpress"]["mise_a_jour"] else []) + \
+        [f"{i['nom']} {i['version']} → {i['derniere']}" for i in items if i["mise_a_jour"]]
+    out["hors_wordpress_org"] = [i["nom"] for i in items if i["source"] == "hors wordpress.org"]
+    if out["hors_wordpress_org"]:
+        out["note_hors_wordpress_org"] = ("versions des extensions et thèmes commerciaux à vérifier dans "
+                                          "wp-admin › Tableau de bord › Mises à jour")
+    return out
+
+
+@mcp.tool()
+async def wp_sante(mises_a_jour: bool = True) -> dict[str, Any]:
+    """Santé du site : tests de WordPress (HTTPS, mises à jour automatiques, tâches planifiées,
+    communication avec wordpress.org, en-tête d'autorisation, cache de page), taille des dossiers
+    et de la base, et, si `mises_a_jour`, versions installées comparées aux dernières publiées sur
+    wordpress.org (cœur, extensions, thèmes ; seul le nom public des extensions est envoyé à
+    wordpress.org). Compte administrateur requis. Ne corrige rien."""
+    client = _get_client()
+    tests = await asyncio.gather(*(_health_test(client, n) for n in HEALTH_TESTS))
+    resume: dict[str, int] = {}
+    for t in tests:
+        resume[t["statut"]] = resume.get(t["statut"], 0) + 1
+    out: dict[str, Any] = {"resume": resume, "tests": list(tests), "tailles": await _directory_sizes(client)}
+    if mises_a_jour:
+        try:
+            out["versions"] = await _versions(client)
+        except WordPressError as e:
+            out["versions"] = {"erreur": str(e)}
+    return out

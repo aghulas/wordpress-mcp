@@ -65,6 +65,7 @@ Variables d'environnement :
 | `wp_redirections` | règles Redirection et journal des 404 | oui | ✔ |
 | `wp_extensions` | extensions installées, inactives, thème actif | admin | ✔ |
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
+| `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
 
 ## Modes d'authentification
 
@@ -91,6 +92,7 @@ Une page Elementor stocke sa mise en page dans la méta `_elementor_data` (JSON)
 - `client.check_read_only` refuse toute méthode autre que `GET`/`HEAD` et tout espace de noms hors liste blanche — avant même d'ouvrir une connexion (test `test_request_refuses_write_before_any_http`). Les espaces d'export/import/installation (`batch/v1`, `ai1wm`, `elementor-one`, `image-optimizer`, `hub-connector`…) sont volontairement exclus.
 - Le mot de passe d'application et le mot de passe du mode cookie ne sont jamais renvoyés par un outil ni journalisé (`httpx` au niveau WARNING, logs sur stderr).
 - Les soumissions de formulaires contiennent des données personnelles : à ne consulter qu'au besoin.
+- `wp_sante` interroge aussi `api.wordpress.org` (module `wporg.py`) : hôte et chemins fixes, GET seulement, aucun identifiant envoyé ; seul le nom public (slug) des extensions et thèmes installés part. `mises_a_jour=False` évite cet appel.
 - Le transport `streamable-http` est désactivé tant qu'il n'y a pas d'authentification par utilisateur (voir `mcp-entra-auth`).
 
 ## Évolutions prévues
