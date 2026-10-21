@@ -167,8 +167,12 @@ async def test_categories_without_mec():
     assert out["categories_evenements"] == []
 
 
+NO_ROUTE = httpx.Response(404, json={"code": "rest_no_route", "message": "Aucune route.", "data": {"status": 404}})
+
+
 @respx.mock
 async def test_formulaires_soumissions():
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/forminator/forms").mock(return_value=NO_ROUTE)
     respx.get(f"{BASE}/wp-json/elementor/v1/forms").mock(
         return_value=httpx.Response(200, json={"data": [{"value": "10_abc", "label": "Contact"}]}))
     respx.get(f"{BASE}/wp-json/elementor/v1/form-submissions").mock(return_value=httpx.Response(200, json={
@@ -181,8 +185,53 @@ async def test_formulaires_soumissions():
     out = await S.wp_formulaires_soumissions(statut="unread")
     assert out["total"] == 1
     s = out["soumissions"][0]
-    assert s["formulaire"] == "Contact" and s["lu"] is False
+    assert s["source"] == "elementor" and s["formulaire"] == "Contact" and s["lu"] is False
     assert s["champs"] == {"name": "Famille Test", "message": "Bonjour"}
+    assert out["formulaires"] == [{"source": "elementor", "id": "10_abc", "nom": "Contact"}]
+    assert len(out["notes"]) == 1 and "wpcode-snippet-forminator.php" in out["notes"][0]
+
+
+FORMINATOR_FORMS = [
+    {"id": 95, "nom": "Pré-inscription", "statut": "publish", "reponses": 2,
+     "champs": [{"slug": "name-1", "libelle": "Nom de l'enfant", "type": "name"},
+                {"slug": "email-1", "libelle": "E-mail", "type": "email"}]},
+    {"id": 96, "nom": "Ancien formulaire", "statut": "draft", "reponses": 0, "champs": []},
+]
+
+
+@respx.mock
+async def test_formulaires_soumissions_forminator():
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/forminator/forms").mock(
+        return_value=httpx.Response(200, json=FORMINATOR_FORMS))
+    entries = respx.get(f"{BASE}/wp-json/wpmcp/v1/forminator/forms/95/entries").mock(
+        return_value=httpx.Response(200, json={"formulaire": 95, "total": 2, "page": 1, "reponses": [
+            {"id": 12, "date": "2026-10-02 09:00:00", "champs": {"name-1": "Enfant Test", "email-1": "a@b.test"}},
+            {"id": 11, "date": "2026-09-20 18:30:00", "champs": {"name-1": "Autre Enfant", "champ-inconnu": "x"}},
+        ]}))
+    respx.get(f"{BASE}/wp-json/elementor/v1/forms").mock(return_value=httpx.Response(200, json={"data": []}))
+    respx.get(f"{BASE}/wp-json/elementor/v1/form-submissions").mock(
+        return_value=httpx.Response(200, json={"data": [], "meta": {"pagination": {"total": 0}}}))
+    out = await S.wp_formulaires_soumissions(depuis="2026-09-01")
+    assert out["total"] == 2 and "notes" not in out
+    assert [f["id"] for f in out["formulaires"]] == [95, 96]
+    first, second = out["soumissions"]
+    assert first["source"] == "forminator" and first["formulaire"] == "Pré-inscription"
+    assert first["champs"] == {"Nom de l'enfant": "Enfant Test", "E-mail": "a@b.test"}
+    assert second["champs"]["champ-inconnu"] == "x"  # slug sans libellé : gardé tel quel
+    assert entries.calls.last.request.url.params["after"] == "2026-09-01"
+    assert not any("/forms/96/" in str(c.request.url) for c in respx.calls)  # aucune réponse : pas d'appel
+
+
+@respx.mock
+async def test_formulaires_soumissions_filtre_forminator_sans_elementor():
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/forminator/forms").mock(
+        return_value=httpx.Response(200, json=FORMINATOR_FORMS))
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/forminator/forms/95/entries").mock(
+        return_value=httpx.Response(200, json={"formulaire": 95, "total": 0, "page": 1, "reponses": []}))
+    elementor = respx.get(f"{BASE}/wp-json/elementor/v1/forms")
+    out = await S.wp_formulaires_soumissions(formulaire="95")
+    assert out["total"] == 0 and out["soumissions"] == []
+    assert not elementor.called  # un id numérique désigne un formulaire Forminator
 
 
 @respx.mock

@@ -417,36 +417,100 @@ async def wp_evenements(a_venir: bool = True, recherche: str | None = None, stat
     return out[:limite]
 
 
+FORMINATOR_SNIPPET = "docs/wpcode-snippet-forminator.php"
+
+
+async def _forminator_submissions(client: WordPressClient, form_id: int | None, depuis: str | None,
+                                  limite: int) -> tuple[list[dict], list[dict], int, str | None]:
+    """Formulaires et réponses Forminator, via les routes du snippet (wpmcp/v1)."""
+    try:
+        forms = await client.get("/wpmcp/v1/forminator/forms")
+    except WordPressError as e:
+        if e.code == "rest_no_route" or e.status == 404:
+            return [], [], 0, f"Forminator : réponses non lisibles, installer le snippet {FORMINATOR_SNIPPET} (WPCode)"
+        if e.code == "forminator_absent":
+            return [], [], 0, None  # pas de Forminator sur ce site : rien à signaler
+        return [], [], 0, f"Forminator : échec ({e})"
+    listed, subs, total = [], [], 0
+    for f in forms or []:
+        labels = {c.get("slug"): (c.get("libelle") or c.get("slug")) for c in f.get("champs") or []}
+        listed.append({"source": "forminator", "id": f.get("id"), "nom": f.get("nom"),
+                       "statut": f.get("statut"), "reponses": f.get("reponses")})
+        if form_id is not None and f.get("id") != form_id:
+            continue
+        if not f.get("reponses"):
+            continue
+        data = await client.get(f"/wpmcp/v1/forminator/forms/{f.get('id')}/entries",
+                                {"per_page": min(100, limite), "after": depuis})
+        total += int(data.get("total") or 0)
+        for r in data.get("reponses") or []:
+            subs.append({
+                "source": "forminator", "id": r.get("id"), "date": r.get("date"),
+                "formulaire": f.get("nom"), "page_origine": None, "url_origine": None, "lu": None,
+                "statut": None,
+                "champs": {labels.get(k, k): v for k, v in (r.get("champs") or {}).items()},
+            })
+    return listed, subs, total, None
+
+
+async def _elementor_submissions(client: WordPressClient, statut: str, form_id: str | None,
+                                 depuis: str | None, limite: int) -> tuple[list[dict], list[dict], int | None, str | None]:
+    """Formulaires et soumissions Elementor Pro (elementor/v1)."""
+    try:
+        forms = await client.get("/elementor/v1/forms", {"context": "options"})
+        data = await client.get("/elementor/v1/form-submissions",
+                                {"status": statut, "form": form_id, "after": depuis,
+                                 "per_page": min(100, limite), "order": "desc"})
+    except WordPressError as e:
+        if e.code == "rest_no_route" or e.status == 404:
+            return [], [], None, None  # pas d'Elementor Pro ou module Formulaires désactivé
+        return [], [], None, f"Elementor : échec ({e})"
+    rows = data.get("data") if isinstance(data, dict) else data
+    subs = [{
+        "source": "elementor", "id": r.get("id"), "date": r.get("created_at"),
+        "formulaire": (r.get("form") or {}).get("name") or (r.get("form") or {}).get("element_id"),
+        "page_origine": (r.get("post") or {}).get("title") or r.get("referer_title"),
+        "url_origine": r.get("referer"), "lu": r.get("is_read"), "statut": r.get("status"),
+        "champs": {(v.get("key") or v.get("id")): v.get("value") for v in (r.get("values") or [])
+                   if isinstance(v, dict)},
+    } for r in rows or []]
+    flist = forms.get("data") if isinstance(forms, dict) else forms
+    listed = [{"source": "elementor", "id": f.get("value"), "nom": f.get("label")}
+              for f in flist or [] if isinstance(f, dict)]
+    meta = data.get("meta") if isinstance(data, dict) else None
+    total = (meta or {}).get("pagination", {}).get("total") if isinstance(meta, dict) else None
+    return listed, subs, total, None
+
+
 @mcp.tool()
 async def wp_formulaires_soumissions(statut: str = "all", formulaire: str | None = None,
                                      depuis: str | None = None, limite: int = 50) -> dict[str, Any]:
-    """Soumissions des formulaires Elementor (contact, inscription…) : date, formulaire, page
-    d'origine, lu/non lu, champs saisis. `statut` : all, unread, read, trash. `formulaire` :
-    identifiant {post_id}_{element_id} (voir `formulaires` dans la réponse). `depuis` :
-    'YYYY-MM-DD'. Compte requis. Données personnelles : à traiter avec discrétion."""
+    """Réponses aux formulaires du site (pré-inscription, contact…), la plus récente en premier :
+    date, formulaire, champs saisis (par libellé). Deux sources : Forminator (lu grâce au snippet
+    docs/wpcode-snippet-forminator.php) et Elementor Pro. `formulaire` : id numérique Forminator ou
+    identifiant Elementor {post_id}_{element_id} (voir `formulaires`). `statut` (Elementor seul) :
+    all, unread, read, trash. `depuis` : 'YYYY-MM-DD'. Compte administrateur requis. Données
+    personnelles de familles : ne restituer que ce qui est demandé."""
     client = _get_client()
-    forms = await client.get("/elementor/v1/forms", {"context": "options"})
-    data = await client.get("/elementor/v1/form-submissions",
-                            {"status": statut, "form": formulaire, "after": depuis,
-                             "per_page": min(100, limite), "order": "desc"})
-    rows = data.get("data") if isinstance(data, dict) else data
-    subs = []
-    for r in rows or []:
-        subs.append({
-            "id": r.get("id"),
-            "date": r.get("created_at"),
-            "formulaire": (r.get("form") or {}).get("name") or (r.get("form") or {}).get("element_id"),
-            "page_origine": (r.get("post") or {}).get("title") or r.get("referer_title"),
-            "url_origine": r.get("referer"),
-            "lu": r.get("is_read"),
-            "statut": r.get("status"),
-            "champs": {(v.get("key") or v.get("id")): v.get("value") for v in (r.get("values") or [])
-                       if isinstance(v, dict)},
-        })
-    meta = data.get("meta") if isinstance(data, dict) else {}
-    return {"formulaires": forms.get("data") if isinstance(forms, dict) else forms,
-            "total": (meta or {}).get("pagination", {}).get("total") if isinstance(meta, dict) else None,
-            "soumissions": subs[:limite]}
+    fid = formulaire.strip() if formulaire else None
+    forminator_id = int(fid) if fid and fid.isdigit() else None
+    notes: list[str] = []
+    f_forms, f_subs, f_total = [], [], 0
+    if fid is None or forminator_id is not None:
+        f_forms, f_subs, f_total, note = await _forminator_submissions(client, forminator_id, depuis, limite)
+        if note:
+            notes.append(note)
+    e_forms, e_subs, e_total = [], [], None
+    if fid is None or forminator_id is None:
+        e_forms, e_subs, e_total, note = await _elementor_submissions(client, statut, fid, depuis, limite)
+        if note:
+            notes.append(note)
+    subs = sorted(f_subs + e_subs, key=lambda r: str(r.get("date") or ""), reverse=True)
+    out: dict[str, Any] = {"formulaires": f_forms + e_forms, "total": f_total + (e_total or len(e_subs)),
+                           "soumissions": subs[:limite]}
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 @mcp.tool()

@@ -44,6 +44,7 @@ ALLOWED_NAMESPACES: frozenset[str] = frozenset({
     "elementor-pro/v1",     # licence
     "mec/v1",               # Modern Events Calendar
     "redirection/v1",       # extension Redirection
+    "wpmcp/v1",             # routes de lecture ajoutées par les snippets de docs/ (réponses Forminator)
 })
 
 READ_METHODS: frozenset[str] = frozenset({"GET", "HEAD"})
