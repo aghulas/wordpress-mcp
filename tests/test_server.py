@@ -194,7 +194,9 @@ async def test_formulaires_soumissions():
 FORMINATOR_FORMS = [
     {"id": 95, "nom": "Pré-inscription", "statut": "publish", "reponses": 2,
      "champs": [{"slug": "name-1", "libelle": "Nom de l'enfant", "type": "name"},
-                {"slug": "email-1", "libelle": "E-mail", "type": "email"}]},
+                {"slug": "email-1", "libelle": "E-mail", "type": "email"},
+                {"slug": "address-1", "libelle": "", "type": "address"},
+                {"slug": "name-2", "libelle": "Nom de l'enfant", "type": "name"}]},
     {"id": 96, "nom": "Ancien formulaire", "statut": "draft", "reponses": 0, "champs": []},
 ]
 
@@ -205,7 +207,8 @@ async def test_formulaires_soumissions_forminator():
         return_value=httpx.Response(200, json=FORMINATOR_FORMS))
     entries = respx.get(f"{BASE}/wp-json/wpmcp/v1/forminator/forms/95/entries").mock(
         return_value=httpx.Response(200, json={"formulaire": 95, "total": 2, "page": 1, "reponses": [
-            {"id": 12, "date": "2026-10-02 09:00:00", "champs": {"name-1": "Enfant Test", "email-1": "a@b.test"}},
+            {"id": 12, "date": "2026-10-02 09:00:00", "champs": {"name-1": "Enfant Test", "email-1": "a@b.test",
+                                                              "address-1": "1 rue Test", "name-2": "Cadet Test"}},
             {"id": 11, "date": "2026-09-20 18:30:00", "champs": {"name-1": "Autre Enfant", "champ-inconnu": "x"}},
         ]}))
     respx.get(f"{BASE}/wp-json/elementor/v1/forms").mock(return_value=httpx.Response(200, json={"data": []}))
@@ -216,7 +219,8 @@ async def test_formulaires_soumissions_forminator():
     assert [f["id"] for f in out["formulaires"]] == [95, 96]
     first, second = out["soumissions"]
     assert first["source"] == "forminator" and first["formulaire"] == "Pré-inscription"
-    assert first["champs"] == {"Nom de l'enfant": "Enfant Test", "E-mail": "a@b.test"}
+    assert first["champs"] == {"Nom de l'enfant": "Enfant Test", "E-mail": "a@b.test", "Adresse": "1 rue Test",
+                               "Nom de l'enfant (2)": "Cadet Test"}  # libellé répété : numéroté, rien d'écrasé
     assert second["champs"]["champ-inconnu"] == "x"  # slug sans libellé : gardé tel quel
     assert entries.calls.last.request.url.params["after"] == "2026-09-01"
     assert not any("/forms/96/" in str(c.request.url) for c in respx.calls)  # aucune réponse : pas d'appel

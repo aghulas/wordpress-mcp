@@ -419,6 +419,29 @@ async def wp_evenements(a_venir: bool = True, recherche: str | None = None, stat
 
 FORMINATOR_SNIPPET = "docs/wpcode-snippet-forminator.php"
 
+# Libellé par défaut d'un champ Forminator laissé sans libellé, selon son type.
+FORMINATOR_DEFAULT_LABELS = {
+    "address": "Adresse", "name": "Nom", "email": "E-mail", "phone": "Téléphone", "date": "Date",
+    "upload": "Fichier", "postdata": "Contenu", "gdprcheckbox": "Consentement RGPD",
+}
+
+
+def _forminator_labels(champs: list[dict]) -> dict[str, str]:
+    """slug → libellé lisible et unique : un libellé répété (un bloc par enfant…) est numéroté
+    « Libellé (2) », « Libellé (3) » dans l'ordre du formulaire, pour ne rien écraser."""
+    base = [(c.get("slug"), (c.get("libelle") or "").strip()
+             or FORMINATOR_DEFAULT_LABELS.get(c.get("type") or "", c.get("slug") or ""))
+            for c in champs if c.get("slug")]
+    total: dict[str, int] = {}
+    for _, label in base:
+        total[label] = total.get(label, 0) + 1
+    seen: dict[str, int] = {}
+    out: dict[str, str] = {}
+    for slug, label in base:
+        seen[label] = seen.get(label, 0) + 1
+        out[slug] = f"{label} ({seen[label]})" if total[label] > 1 and seen[label] > 1 else label
+    return out
+
 
 async def _forminator_submissions(client: WordPressClient, form_id: int | None, depuis: str | None,
                                   limite: int) -> tuple[list[dict], list[dict], int, str | None]:
@@ -433,7 +456,7 @@ async def _forminator_submissions(client: WordPressClient, form_id: int | None, 
         return [], [], 0, f"Forminator : échec ({e})"
     listed, subs, total = [], [], 0
     for f in forms or []:
-        labels = {c.get("slug"): (c.get("libelle") or c.get("slug")) for c in f.get("champs") or []}
+        labels = _forminator_labels(f.get("champs") or [])
         listed.append({"source": "forminator", "id": f.get("id"), "nom": f.get("nom"),
                        "statut": f.get("statut"), "reponses": f.get("reponses")})
         if form_id is not None and f.get("id") != form_id:
