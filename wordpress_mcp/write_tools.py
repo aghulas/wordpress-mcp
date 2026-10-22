@@ -2,7 +2,7 @@
 
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
 wp_page_creer_preparer, wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
-wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
+wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer, wp_extraits_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_snippet_installer_preparer,
 wp_snippet_activer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
@@ -1142,6 +1142,77 @@ async def _exec_medias_alt(client: WordPressClient, gate: WriteGate, p: PendingW
     return {"images": done}
 
 
+# ======================================================================= extraits (descriptions)
+EXCERPT_MAX = 300
+EXCERPT_GOOGLE = 160
+
+
+@mcp.tool()
+async def wp_extraits_preparer(elements: list[dict[str, Any]], type_contenu: str = "page") -> dict[str, Any]:
+    """PRÉPARE l'écriture de l'extrait (résumé) de 1 à 50 pages ou articles ; n'écrit rien.
+    `elements` : [{"id": 676, "extrait": "…"}, …]. L'extrait sert de description dans les résultats
+    de recherche (balise meta description posée par un snippet), de résumé au partage du lien
+    (og:description) et dans la recherche du site. Texte brut, 160 caractères conseillés (300 au plus) ;
+    `"extrait": ""` revient au résumé automatique. Visible dès la confirmation."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    if not elements or len(elements) > 50:
+        raise WordPressError("de 1 à 50 éléments", code="parametre")
+    base = CONTENT_PATHS.get(type_contenu)
+    if not base:
+        raise WordPressError(f"type_contenu inconnu : {type_contenu}", code="parametre")
+    plan, rows, guard, warnings, seen = [], [], {}, [], set()
+    for e in elements:
+        cid = int(e.get("id"))
+        if cid in seen:
+            raise WordPressError(f"{type_contenu} {cid} en double", code="parametre")
+        seen.add(cid)
+        text = re.sub(r"\s+", " ", str(e.get("extrait") or "")).strip()
+        if "<" in text or ">" in text:
+            raise WordPressError(f"{type_contenu} {cid} : texte brut attendu (pas de balise)", code="parametre")
+        if len(text) > EXCERPT_MAX:
+            raise WordPressError(f"{type_contenu} {cid} : {len(text)} caractères (300 au plus)", code="parametre")
+        cur = await client.get(f"{base}/{cid}", {"context": "edit"})
+        if "excerpt" not in cur:
+            raise WordPressError(f"{type_contenu} {cid} : pas de champ extrait sur ce type de contenu", code="parametre")
+        before = (cur.get("excerpt") or {}).get("raw", "")
+        if text == before.strip():
+            continue
+        plan.append({"id": cid, "payload": {"excerpt": text}})
+        guard[str(cid)] = fingerprint([before])
+        rows.append({"id": cid, "titre": html.unescape(_raw(cur.get("title"))), "statut": cur.get("status"),
+                     "avant": before or "(résumé automatique)", "apres": text or "(résumé automatique)",
+                     "caracteres": len(text)})
+        if len(text) > EXCERPT_GOOGLE:
+            warnings.append(f"{type_contenu} {cid} : {len(text)} caractères, Google coupe vers {EXCERPT_GOOGLE}.")
+    if not plan:
+        raise WordPressError("aucun changement", code="aucun_changement")
+    if any(r["statut"] == "publish" for r in rows):
+        warnings.insert(0, "Les extraits des pages publiées sont visibles dès la confirmation (résumé de partage, "
+                           "recherche du site, description pour les moteurs si le snippet est actif).")
+    return gate.prepare("extraits", {"base": base, "plan": plan},
+                        summary=f"Écrire l'extrait de {len(plan)} {type_contenu}(s)",
+                        preview={"extraits": rows}, guard=guard, warnings=warnings)
+
+
+async def _exec_extraits(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    base = p.args["base"]
+    for step in p.args["plan"]:
+        cur = await client.get(f"{base}/{step['id']}", {"context": "edit"})
+        if fingerprint([(cur.get("excerpt") or {}).get("raw", "")]) != p.guard.get(str(step["id"])):
+            raise _stale_error(f"L'extrait de {step['id']}")
+    done = []
+    for step in p.args["plan"]:
+        data = await client.write("POST", f"{base}/{step['id']}", json=step["payload"])
+        got = (data.get("excerpt") or {}).get("raw")
+        if got is not None and got.strip() != step["payload"]["excerpt"]:
+            raise WordPressError(f"extrait de {step['id']} relu différent : le vérifier", code="verification_echouee")
+        done.append({"id": data.get("id"), "titre": html.unescape(_raw(data.get("title")))})
+    gate.journal("extraits", True, ids=[s["id"] for s in p.args["plan"]])
+    return {"extraits_ecrits": done}
+
+
 # ======================================================================= confirmation
 # ------------------------------------------------------------------ snippets WPCode
 SNIPPET_FILE_RE = re.compile(r"wpcode-snippet-[a-z0-9]+(?:-[a-z0-9]+)*\.php")
@@ -1358,6 +1429,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "page_creer": _exec_page_creer,
     "snippet_installer": _exec_snippet_installer,
     "snippet_activer": _exec_snippet_activer,
+    "extraits": _exec_extraits,
 }
 
 

@@ -840,3 +840,41 @@ async def test_snippets_missing_routes(snippets_dir):
     with pytest.raises(WordPressError) as e:
         await WT.wp_snippet_installer_preparer("wpcode-snippet-x.php", "MCP X")
     assert e.value.code == "snippets_indisponibles"
+
+
+
+# ------------------------------------------------------------------ extraits
+@respx.mock
+async def test_extraits_batch(writes_on):
+    pages = {676: {"id": 676, "status": "publish", "title": {"raw": "Notre école"}, "excerpt": {"raw": ""}},
+             749: {"id": 749, "status": "publish", "title": {"raw": "Les horaires"}, "excerpt": {"raw": "Ancien"}}}
+    respx.get(url__regex=rf"{BASE}/wp-json/wp/v2/pages/\d+(\?.*)?$").mock(
+        side_effect=lambda r: httpx.Response(200, json=pages[int(r.url.path.rsplit("/", 1)[1])]))
+
+    def write(request):
+        pid = int(request.url.path.rsplit("/", 1)[1])
+        pages[pid]["excerpt"] = {"raw": json.loads(request.content)["excerpt"]}
+        return httpx.Response(200, json=pages[pid])
+    post = respx.post(url__regex=rf"{BASE}/wp-json/wp/v2/pages/\d+(\?.*)?$").mock(side_effect=write)
+    long = "x" * 170
+    prep = await WT.wp_extraits_preparer([{"id": 676, "extrait": "  L'école   accueille 400 élèves. "},
+                                          {"id": 749, "extrait": long}])
+    rows = prep["apercu"]["extraits"]
+    assert rows[0]["avant"] == "(résumé automatique)" and rows[0]["apres"] == "L'école accueille 400 élèves."
+    assert any("170 caractères" in w for w in prep["avertissements"]) and not _writes()
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert pages[676]["excerpt"]["raw"] == "L'école accueille 400 élèves." and len(out["extraits_ecrits"]) == 2
+    for elements, code in [([{"id": 676, "extrait": "<b>gras</b>"}], "parametre"),
+                           ([{"id": 676, "extrait": "y" * 301}], "parametre"),
+                           ([{"id": 676, "extrait": "L'école accueille 400 élèves."}], "aucun_changement"),
+                           ([], "parametre")]:
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_extraits_preparer(elements)
+        assert e.value.code == code
+    # extrait modifié entre l'aperçu et la confirmation
+    prep = await WT.wp_extraits_preparer([{"id": 749, "extrait": "Horaires de l'école."}])
+    pages[749]["excerpt"] = {"raw": "Changé ailleurs"}
+    n = post.call_count
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert post.call_count == n
