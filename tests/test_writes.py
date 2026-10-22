@@ -502,3 +502,87 @@ async def test_widget_edit_regenerates_fallback_when_needed(writes_on):
     assert any("régénéré" in w for w in prep["avertissements"])
     await WT.wp_ecriture_confirmer(prep["jeton"])
     assert page.content == E.build_fallback_html(page.raw) and "Élémentaire (CP-CM2)" in page.content
+
+
+# ------------------------------------------------------------------ mise en page d'un modèle
+class FakeDraft:
+    """Page 30 en brouillon, vide, qui reçoit la mise en page du modèle 10 (FakePage)."""
+
+    def __init__(self, status="draft", raw="", content=""):
+        self.status, self.raw, self.content, self.n, self.meta = status, raw, content, 0, {}
+
+    def json(self):
+        return {"id": 30, "status": self.status, "link": f"{BASE}/?page_id=30", "title": {"raw": "La pastorale"},
+                "modified": f"2026-10-22T10:00:0{self.n}", "content": {"raw": self.content}, "template": "",
+                "meta": {"_elementor_data": self.raw, "_elementor_edit_mode": self.meta.get("_elementor_edit_mode", ""),
+                         "_elementor_template_type": self.meta.get("_elementor_template_type", "")}}
+
+    def get(self, request):
+        return httpx.Response(200, json=self.json())
+
+    def post(self, request):
+        body = json.loads(request.content)
+        self.meta.update(body.get("meta") or {})
+        self.raw = self.meta.get("_elementor_data", self.raw)
+        self.content = body.get("content", self.content)
+        self.n += 1
+        return httpx.Response(200, json=self.json())
+
+
+@respx.mock
+async def test_page_modele_copies_layout_fills_texts_and_renumbers(writes_on):
+    model, draft = FakePage(builder=True), FakeDraft()
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=model.get)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/30").mock(side_effect=draft.get)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/30").mock(side_effect=draft.post)
+    cache = respx.delete(f"{BASE}/wp-json/elementor/v1/cache").mock(return_value=httpx.Response(200, json=True))
+    prep = await WT.wp_page_modele_preparer(30, 10, textes={"w1": "La pastorale", "w2": "Premier.\n\nSecond."},
+                                            exclure=["w5", "w6"])
+    assert not _writes()
+    assert prep["apercu"]["structure"]["par_type"] == {"column": 1, "section": 1, "widget:button": 1,
+                                                        "widget:heading": 1, "widget:icon-list": 1,
+                                                        "widget:text-editor": 1}
+    filled = {f["widget_modele"]: f for f in prep["apercu"]["textes_remplis"]}
+    assert filled["w1"]["champ"] == "title" and filled["w2"]["champ"] == "editor"
+    assert filled["w1"]["widget"] != "w1" and len(filled["w1"]["widget"]) == 7
+    assert any("gardent le texte du modèle" in w for w in prep["avertissements"])
+    assert prep["apercu"]["resume_de_partage_apres"].startswith("La pastorale Premier. Second.")
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    body = json.loads(post.calls.last.request.content)
+    assert body["meta"]["_elementor_edit_mode"] == "builder" and body["meta"]["_elementor_template_type"] == "wp-page"
+    tree = json.loads(draft.raw)
+    widgets = tree[0]["elements"][0]["elements"]
+    assert [w["widgetType"] for w in widgets] == ["heading", "text-editor", "button", "icon-list"]
+    assert widgets[0]["settings"]["title"] == "La pastorale"
+    assert widgets[1]["settings"]["editor"] == "<p>Premier.</p>\n<p>Second.</p>"
+    assert widgets[2]["settings"]["text"] == "Nous contacter"  # non rempli : texte du modèle
+    ids = {el["id"] for el in [tree[0], tree[0]["elements"][0], *widgets]}
+    assert len(ids) == 6 and not ids & {"s1", "c1", "w1", "w2", "w3", "w4"}
+    assert "<h1>La pastorale</h1>" in draft.content and cache.called
+    assert out["statut"] == "brouillon" and out["sauvegarde"].startswith("pages-30-")
+    assert [w["widget"] for w in out["widgets"]] == [w["id"] for w in widgets]
+    assert model.raw == ELEMENTOR_DATA  # le modèle n'est pas touché
+
+
+@respx.mock
+async def test_page_modele_refusals(writes_on):
+    model = FakePage(builder=True)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/10").mock(side_effect=model.get)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/30").mock(side_effect=FakeDraft(status="publish").get)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/31").mock(side_effect=FakeDraft().get)
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/14").mock(side_effect=FakePage(builder=False).get)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/31").mock(return_value=httpx.Response(200, json={}))
+    cases = [((30, 10), {}, "page_publiee"), ((31, 31), {}, "parametre"), ((31, 14), {}, "pas_elementor"),
+             ((31, 10), {"exclure": ["zz"]}, "widget_introuvable"),
+             ((31, 10), {"textes": {"w9": "x"}}, "widget_introuvable"),
+             ((31, 10), {"textes": {"w6": "x"}}, "champ_introuvable")]
+    for args, kw, code in cases:
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_page_modele_preparer(*args, **kw)
+        assert e.value.code == code, (args, kw)
+    # modèle modifié entre l'aperçu et la confirmation
+    prep = await WT.wp_page_modele_preparer(31, 10)
+    model.raw = ELEMENTOR_DATA.replace("Nous contacter", "Contact")
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and not post.called

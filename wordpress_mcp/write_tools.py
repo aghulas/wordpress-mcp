@@ -1,7 +1,7 @@
 """Outils d'écriture (v2) : préparer → aperçu → confirmer. Voir writes.py pour les verrous.
 
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
-wp_page_preparer, wp_page_regenerer_preparer, wp_menu_entree_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
+wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
 
@@ -607,6 +607,177 @@ async def _exec_page_regenerer(client: WordPressClient, gate: WriteGate, p: Pend
     gate.journal("page_regenerer", True, chemin=path, sauvegarde=backup)
     return {"lien": item.get("link"), "sauvegarde": backup, "avertissements": warnings}
 
+
+# ======================================================================= pages : mise en page d'un modèle
+MAIN_TEXT_FIELDS = ("editor", "title", "text", "description_text", "title_text", "description")
+
+
+def _main_text_field(el: dict[str, Any]) -> str | None:
+    """Champ texte principal d'un widget (celui que `textes=` remplit)."""
+    if el.get("widgetType") in ("divider", "spacer", "shortcode", "html"):
+        return None
+    settings = el.get("settings") or {}
+    for key in MAIN_TEXT_FIELDS:
+        if isinstance(settings.get(key), str):
+            return key
+    return None
+
+
+def _renumber(tree: list[dict[str, Any]]) -> dict[str, str]:
+    """Nouveaux identifiants (7 caractères hexadécimaux, comme Elementor) pour tous les éléments ;
+    renvoie la correspondance ancien → nouveau."""
+    import secrets
+    mapping: dict[str, str] = {}
+    for el, _ in E.walk(tree):
+        old = str(el.get("id") or "")
+        new = secrets.token_hex(4)[:7]
+        while new in mapping.values():
+            new = secrets.token_hex(4)[:7]
+        mapping[old] = new
+        el["id"] = new
+    return mapping
+
+
+def _drop_elements(tree: list[dict[str, Any]], ids: set[str]) -> int:
+    removed = 0
+    for el in list(tree):
+        if str(el.get("id")) in ids:
+            tree.remove(el)
+            removed += 1
+            continue
+        children = el.get("elements")
+        if isinstance(children, list):
+            removed += _drop_elements(children, ids)
+    return removed
+
+
+def _widgets_view(tree: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out = []
+    for el, _ in E.walk(tree):
+        if el.get("elType") == "widget":
+            field = _main_text_field(el)
+            text = E.html_to_text((el.get("settings") or {}).get(field)) if field else ""
+            out.append({"widget": el.get("id"), "type": el.get("widgetType"), "champ": field,
+                        "texte": _short(text, 120)})
+    return out
+
+
+@mcp.tool()
+async def wp_page_modele_preparer(id: int, modele_id: int, textes: dict[str, str] | None = None,
+                                  exclure: list[str] | None = None, type_contenu: str = "page") -> dict[str, Any]:
+    """PRÉPARE la reprise de la mise en page Elementor d'une page modèle (`modele_id`, construite
+    avec Elementor) dans une page existante **en brouillon** (`id`) ; n'écrit rien. Sert à remplir
+    une page vide avec la même structure qu'une page du site (titres, blocs de texte, séparateurs),
+    sans rien créer : la page cible doit déjà exister (wp-admin) et ne pas être publiée.
+    `textes` : {identifiant de widget du modèle (voir wp_contenu_lire(modele_id, format='elementor')):
+    nouveau texte} pour remplir en même temps les titres et blocs de texte (HTML ou texte brut
+    converti en paragraphes) ; `exclure` : identifiants de widgets (ou sections) du modèle à ne pas
+    reprendre. Les autres widgets gardent le texte du modèle : les corriger ensuite avec
+    wp_widget_texte_preparer (les nouveaux identifiants sont renvoyés). Le contenu actuel de la
+    page cible est sauvegardé puis remplacé ; la page reste en brouillon (publier avec
+    wp_page_preparer après relecture)."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    if int(id) == int(modele_id):
+        raise WordPressError("la page cible et le modèle doivent être différents", code="parametre")
+    path = _content_path(type_contenu, id)
+    model_path = _content_path(type_contenu, modele_id)
+    target = await client.get(path, {"context": "edit"})
+    if target.get("status") == "publish":
+        raise WordPressError(f"{type_contenu} {id} est publié : le passer d'abord en brouillon avec "
+                             f"wp_page_preparer(id={id}, statut='draft'), ou choisir une autre page cible",
+                             code="page_publiee")
+    model, model_raw, model_tree = await _read_elementor(client, model_path)
+    if not _is_builder(model):
+        raise WordPressError(f"le modèle {modele_id} n'est pas affiché par Elementor", code="pas_elementor")
+    new_tree = copy.deepcopy(model_tree)
+    excluded = {str(x) for x in (exclure or [])}
+    unknown = [x for x in excluded if E.find_element(model_tree, x) is None]
+    if unknown:
+        raise WordPressError(f"éléments à exclure introuvables dans le modèle : {', '.join(unknown)}",
+                             code="widget_introuvable")
+    _drop_elements(new_tree, excluded)
+    filled: list[dict[str, Any]] = []
+    for wid, text in (textes or {}).items():
+        el = E.find_element(new_tree, str(wid))
+        if el is None or el.get("elType") != "widget":
+            raise WordPressError(f"widget {wid} introuvable dans le modèle (ou exclu)", code="widget_introuvable")
+        field = _main_text_field(el)
+        if field is None:
+            raise WordPressError(f"le widget {wid} ({el.get('widgetType')}) n'a pas de champ texte principal",
+                                 code="champ_introuvable")
+        value = _as_html(text) if E.is_html_field(field) else text
+        E.set_setting(el["settings"], field, value)
+        filled.append({"widget_modele": str(wid), "champ": field, "apres": _short(E.html_to_text(value), 200)})
+    mapping = _renumber(new_tree)
+    for f in filled:
+        f["widget"] = mapping.get(f["widget_modele"])
+    new_raw = E.dump_elementor_data(new_tree)
+    new_content = E.build_fallback_html(new_raw)
+    meta = model.get("meta") or {}
+    page_settings = meta.get("_elementor_page_settings")
+    payload: dict[str, Any] = {
+        "content": new_content,
+        "template": model.get("template") or "",
+        "meta": {"_elementor_data": new_raw, "_elementor_edit_mode": "builder",
+                 "_elementor_template_type": meta.get("_elementor_template_type") or "wp-page",
+                 **({"_elementor_page_settings": page_settings} if isinstance(page_settings, dict) else {})},
+    }
+    target_raw = (target.get("meta") or {}).get("_elementor_data") or ""
+    warnings = [f"La page reste en brouillon ({PAGE_STATUSES.get(target.get('status'), target.get('status'))}) : "
+                "relire l'aperçu en étant connecté à wp-admin, puis publier avec wp_page_preparer."]
+    if target_raw or _raw(target.get("content")).strip():
+        warnings.append("La page cible a déjà un contenu : il sera remplacé (sauvegardé avant, restaurable "
+                        "avec wp_page_restaurer_preparer).")
+    if len(filled) < sum(1 for w in _widgets_view(new_tree) if w["champ"]):
+        warnings.append("Les widgets non remplis gardent le texte du modèle : les corriger ensuite avec "
+                        "wp_widget_texte_preparer, ou les retirer avec `exclure`.")
+    preview = {"cible": f"{type_contenu} {id} « {_raw(target.get('title'))} »", "lien": target.get("link"),
+               "modele": f"{type_contenu} {modele_id} « {_raw(model.get('title'))} »", "lien_modele": model.get("link"),
+               "structure": E.structure_summary(new_raw), "exclus": sorted(excluded),
+               "textes_remplis": filled, "widgets_apres": _widgets_view(new_tree),
+               "resume_de_partage_apres": _short(" ".join(E.html_to_text(new_content).split()), 160)}
+    return gate.prepare("page_modele", {"path": path, "model_path": model_path, "payload": payload,
+                                        "widgets": _widgets_view(new_tree)},
+                        summary=f"Reprendre la mise en page de « {_raw(model.get('title'))} » dans "
+                                f"« {_raw(target.get('title'))} » ({len(filled)} texte(s) rempli(s))",
+                        preview=preview, warnings=warnings,
+                        guard={"modified": target.get("modified"), "status": target.get("status"),
+                               "modele": fingerprint(model_raw)})
+
+
+async def _exec_page_modele(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    path, model_path, payload = p.args["path"], p.args["model_path"], p.args["payload"]
+    target = await client.get(path, {"context": "edit"})
+    if target.get("modified") != p.guard.get("modified") or target.get("status") != p.guard.get("status"):
+        raise _stale_error("La page cible")
+    if target.get("status") == "publish":
+        raise WordPressError("la page cible a été publiée entre-temps : écriture annulée", code="page_publiee")
+    model = await client.get(model_path, {"context": "edit"})
+    if fingerprint((model.get("meta") or {}).get("_elementor_data") or "") != p.guard.get("modele"):
+        raise _stale_error("Le modèle")
+    target_raw = (target.get("meta") or {}).get("_elementor_data") or ""
+    backup = gate.save_backup(path.strip("/").split("/")[-2], int(target["id"]),
+                              _backup_payload(path, target, target_raw))
+    await client.write("POST", path, json=payload)
+    check = await client.get(path, {"context": "edit"})
+    meta = check.get("meta") or {}
+    if E.parse_elementor_data(meta.get("_elementor_data")) != E.parse_elementor_data(payload["meta"]["_elementor_data"]) \
+            or meta.get("_elementor_edit_mode") != "builder":
+        raise WordPressError("le contenu relu après écriture ne correspond pas : vérifier la page et la "
+                             "restaurer depuis la sauvegarde si besoin", code="verification_echouee")
+    warnings = []
+    try:
+        await client.write("DELETE", "/elementor/v1/cache")
+    except WordPressError as e:
+        warnings.append(f"cache Elementor non vidé ({e})")
+    gate.journal("page_modele", True, chemin=path, modele=model_path, sauvegarde=backup)
+    return {"lien": check.get("link"), "statut": PAGE_STATUSES.get(check.get("status"), check.get("status")),
+            "sauvegarde": backup, "widgets": p.args["widgets"], "avertissements": warnings,
+            "etape_suivante": "relire la page (aperçu wp-admin), corriger les textes restants avec "
+                              "wp_widget_texte_preparer, puis publier avec wp_page_preparer(statut='publish')"}
+
 # ======================================================================= pages : titre et statut
 PAGE_STATUSES = {"publish": "publié", "draft": "brouillon", "private": "privé", "pending": "en attente de relecture"}
 
@@ -797,6 +968,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "menu_entree": _exec_menu_entree,
     "medias_alt": _exec_medias_alt,
     "page_regenerer": _exec_page_regenerer,
+    "page_modele": _exec_page_modele,
 }
 
 
