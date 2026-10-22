@@ -40,7 +40,8 @@ def _writes():
                                          ("POST", "/wp/v2/pages/644"), ("POST", "/wp/v2/media"),
                                          ("POST", "/wp/v2/media/9"), ("POST", "/redirection/v1/redirect"),
                                          ("POST", "/redirection/v1/bulk/redirect/disable"),
-                                         ("DELETE", "/elementor/v1/cache"), ("POST", "/wp/v2/menu-items/765")])
+                                         ("DELETE", "/elementor/v1/cache"), ("POST", "/wp/v2/menu-items/765"),
+                                         ("POST", "/wp/v2/menu-items")])
 def test_allowed_writes(method, path):
     check_write_allowed(method, path)
 
@@ -51,7 +52,7 @@ def test_allowed_writes(method, path):
                                          ("POST", "/redirection/v1/bulk/redirect/delete"),
                                          ("POST", "/wp/v2/pages"), ("POST", "/wp/v2/posts/12/../../users"),
                                          ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x"),
-                                         ("DELETE", "/wp/v2/menu-items/765"), ("POST", "/wp/v2/menu-items"),
+                                         ("DELETE", "/wp/v2/menu-items/765"), ("POST", "/wp/v2/menu-items/765/../1"),
                                          ("POST", "/wp/v2/menus/5")])
 def test_refused_writes(method, path):
     with pytest.raises(WordPressError) as e:
@@ -586,3 +587,62 @@ async def test_page_modele_refusals(writes_on):
     with pytest.raises(WordPressError) as e:
         await WT.wp_ecriture_confirmer(prep["jeton"])
     assert e.value.code == "modifie_entre_temps" and not post.called
+
+
+# ------------------------------------------------------------------ ajout d'une entrée de menu
+MENU_MAIN = [
+    {"id": 899, "title": {"raw": "Accueil"}, "status": "publish", "type": "custom", "object": "custom",
+     "object_id": 899, "url": f"{BASE}/", "menus": 2, "parent": 0, "menu_order": 1},
+    {"id": 738, "title": {"raw": "Restauration"}, "status": "publish", "type": "post_type", "object": "page",
+     "object_id": 736, "url": f"{BASE}/restauration", "menus": 2, "parent": 0, "menu_order": 15},
+    {"id": 743, "title": {"raw": "La pastorale"}, "status": "draft", "type": "post_type", "object": "page",
+     "object_id": 726, "url": f"{BASE}/?page_id=726", "menus": 2, "parent": 0, "menu_order": 7},
+]
+PAGE1884 = {"id": 1884, "status": "publish", "link": f"{BASE}/menus-de-la-cantine",
+            "title": {"raw": "Menus de la cantine"}}
+
+
+@respx.mock
+async def test_menu_entry_add_under_parent(writes_on):
+    items = [dict(i) for i in MENU_MAIN]
+    respx.get(f"{BASE}/wp-json/wp/v2/menus").mock(return_value=httpx.Response(
+        200, json=[{"id": 2, "name": "Menu", "slug": "menu"}, {"id": 5, "name": "Accès rapide", "slug": "acces-rapide"}]))
+    respx.get(f"{BASE}/wp-json/wp/v2/menu-items").mock(side_effect=lambda r: httpx.Response(200, json=items))
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/1884").mock(return_value=httpx.Response(200, json=PAGE1884))
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/726").mock(return_value=httpx.Response(
+        200, json={**PAGE1884, "id": 726, "status": "draft"}))
+
+    def create(request):
+        body = json.loads(request.content)
+        new = {**body, "id": 2001, "title": {"raw": body["title"]}, "url": f"{BASE}/menus-de-la-cantine"}
+        items.append(new)
+        return httpx.Response(201, json=new)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/menu-items").mock(side_effect=create)
+    respx.get(f"{BASE}/wp-json/wp/v2/menu-items/2001").mock(
+        side_effect=lambda r: httpx.Response(200, json=next(i for i in items if i["id"] == 2001)))
+    prep = await WT.wp_menu_entree_ajouter_preparer("menu", page_id=1884, parent=738)
+    assert prep["apercu"]["emplacement"] == "sous « Restauration »" and prep["apercu"]["libelle"] == "Menus de la cantine"
+    assert prep["apercu"]["ordre"] == 16 and not _writes()
+    assert "VISIBLE IMMÉDIATEMENT" in prep["avertissements"][0]
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    body = json.loads(post.calls.last.request.content)
+    assert body == {"menus": 2, "parent": 738, "status": "publish", "type": "post_type", "object": "page",
+                    "object_id": 1884, "title": "Menus de la cantine", "menu_order": 16}
+    assert out["id"] == 2001 and out["annuler"] == "wp_menu_entree_preparer(id=2001, masquer=True)"
+    # refus : déjà présent au même endroit, page non publiée, menu ou parent inconnus, lien sans libellé
+    cases = [(("menu",), {"page_id": 1884, "parent": 738}, "deja_present"),
+             (("menu",), {"page_id": 726}, "parametre"),
+             (("inconnu",), {"page_id": 1884}, "parametre"),
+             (("2",), {"page_id": 1884, "parent": 999}, "parametre"),
+             (("2",), {"url": "/contact"}, "parametre"),
+             (("2",), {}, "parametre")]
+    for args, kw, code in cases:
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_menu_entree_ajouter_preparer(*args, **kw)
+        assert e.value.code == code, (args, kw)
+    # menu modifié entre l'aperçu et la confirmation
+    prep = await WT.wp_menu_entree_ajouter_preparer("Accès rapide", url="/contact", libelle="Contact")
+    items.append({"id": 3000, "parent": 0, "menu_order": 2, "status": "publish", "object_id": 0, "url": "x"})
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and post.call_count == 1

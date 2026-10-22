@@ -1,7 +1,8 @@
 """Outils d'écriture (v2) : préparer → aperçu → confirmer. Voir writes.py pour les verrous.
 
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
-wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
+wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
+wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
 
@@ -906,6 +907,108 @@ async def _exec_menu_entree(client: WordPressClient, gate: WriteGate, p: Pending
     return {"entree": _item_view(data)}
 
 
+def _menu_fingerprint(items: list[dict[str, Any]]) -> str:
+    return fingerprint(sorted((i.get("id"), i.get("parent"), i.get("menu_order"), i.get("status"),
+                               i.get("object_id"), i.get("url")) for i in items))
+
+
+@mcp.tool()
+async def wp_menu_entree_ajouter_preparer(menu: str, page_id: int | None = None, url: str | None = None,
+                                          libelle: str | None = None, parent: int = 0,
+                                          apres: int | None = None) -> dict[str, Any]:
+    """PRÉPARE l'ajout d'une entrée à un menu existant (identifiant, nom ou slug : voir wp_menus) ;
+    n'écrit rien. `page_id` : page publiée (libellé par défaut = son titre) ou `url` (https://… ou
+    chemin du site, `libelle` obligatoire). `parent` : identifiant de l'entrée sous laquelle la
+    placer (sous-menu) ; 0 = premier niveau. `apres` : identifiant de l'entrée sœur après laquelle
+    la placer (défaut : en dernier parmi ses sœurs). L'entrée est visible dès la confirmation ;
+    elle peut ensuite être masquée avec wp_menu_entree_preparer(masquer=True). Aucune suppression."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    if (page_id is None) == (url is None):
+        raise WordPressError("indiquer `page_id` OU `url`", code="parametre")
+    menus = await client.get_all("/wp/v2/menus", {"context": "edit"})
+    key = str(menu).strip().lower()
+    target = next((m for m in menus if str(m.get("id")) == key or str(m.get("slug", "")).lower() == key
+                   or html.unescape(str(m.get("name", ""))).strip().lower() == key), None)
+    if target is None:
+        raise WordPressError(f"menu inconnu : « {menu} ». Menus : " + ", ".join(
+            f"{html.unescape(m.get('name', ''))} ({m.get('id')})" for m in menus), code="parametre")
+    menu_id = int(target["id"])
+    items = await client.get_all("/wp/v2/menu-items", {"context": "edit", "menus": menu_id,
+                                                       "status": "publish,draft"})
+    by_id = {int(i["id"]): i for i in items}
+    parent = int(parent or 0)
+    if parent and parent not in by_id:
+        raise WordPressError(f"l'entrée parente {parent} n'appartient pas au menu « {target.get('name')} »",
+                             code="parametre")
+    payload: dict[str, Any] = {"menus": menu_id, "parent": parent, "status": "publish"}
+    if page_id is not None:
+        page = await client.get(f"/wp/v2/pages/{int(page_id)}", {"context": "edit"})
+        if page.get("status") != "publish":
+            raise WordPressError(f"la page {page_id} n'est pas publiée : la publier d'abord (wp_page_preparer)",
+                                 code="parametre")
+        dup = [i for i in items if i.get("type") == "post_type" and i.get("object_id") == int(page_id)
+               and int(i.get("parent") or 0) == parent]
+        if dup:
+            raise WordPressError(f"la page {page_id} est déjà dans ce menu à cet endroit (entrée {dup[0]['id']}"
+                                 f"{', masquée' if dup[0].get('status') != 'publish' else ''}) : utiliser "
+                                 "wp_menu_entree_preparer", code="deja_present")
+        label = (libelle or "").strip() or html.unescape(_raw(page.get("title")))
+        payload.update({"type": "post_type", "object": "page", "object_id": int(page_id), "title": label})
+        link = page.get("link")
+    else:
+        if not (libelle or "").strip():
+            raise WordPressError("`libelle` obligatoire pour un lien personnalisé", code="parametre")
+        u = url.strip()
+        if not u.startswith("https://"):
+            u = client.settings.base_url.rstrip("/") + _site_path(client, u, "url")
+        label = libelle.strip()
+        payload.update({"type": "custom", "url": u, "title": label})
+        link = u
+    siblings = sorted((i for i in items if int(i.get("parent") or 0) == parent),
+                      key=lambda i: i.get("menu_order") or 0)
+    if apres is not None:
+        ref = next((i for i in siblings if int(i["id"]) == int(apres)), None)
+        if ref is None:
+            raise WordPressError(f"l'entrée {apres} n'est pas une entrée sœur à cet endroit du menu", code="parametre")
+        order = int(ref.get("menu_order") or 0) + 1
+    else:
+        ref_orders = [int(i.get("menu_order") or 0) for i in siblings]
+        if parent:
+            ref_orders.append(int(by_id[parent].get("menu_order") or 0))
+        order = max(ref_orders, default=0) + 1
+    payload["menu_order"] = order
+    where = (f"sous « {html.unescape(_raw(by_id[parent].get('title')))} »" if parent else "au premier niveau")
+    preview = {"menu": f"{html.unescape(target.get('name', ''))} ({menu_id})", "emplacement": where,
+               "libelle": label, "lien": link, "ordre": order,
+               "soeurs_actuelles": [html.unescape(_raw(i.get("title"))) for i in siblings]}
+    warnings = ["L'entrée sera VISIBLE IMMÉDIATEMENT dans le menu, sur toutes les pages du site.",
+                "Si une extension de cache de page est active, les pages déjà en cache montreront l'ancien "
+                "menu jusqu'à leur expiration (ou vider le cache de l'extension)."]
+    return gate.prepare("menu_entree_ajouter", {"payload": payload, "menu_id": menu_id},
+                        summary=f"Ajouter « {label} » au menu « {html.unescape(target.get('name', ''))} » {where}",
+                        preview=preview, guard={"menu": _menu_fingerprint(items)}, warnings=warnings)
+
+
+async def _exec_menu_entree_ajouter(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    items = await client.get_all("/wp/v2/menu-items", {"context": "edit", "menus": p.args["menu_id"],
+                                                       "status": "publish,draft"})
+    if _menu_fingerprint(items) != p.guard.get("menu"):
+        raise _stale_error("Le menu")
+    data = await client.write("POST", "/wp/v2/menu-items", json=p.args["payload"])
+    new_id = data.get("id")
+    check = await client.get(f"/wp/v2/menu-items/{int(new_id)}", {"context": "edit"})
+    expected = p.args["payload"]
+    if check.get("menus") != expected["menus"] or int(check.get("parent") or 0) != expected["parent"]:
+        raise WordPressError(f"entrée {new_id} créée mais relue différente : vérifier dans Apparence › Menus",
+                             code="verification_echouee")
+    gate.journal("menu_entree_ajouter", True, id=new_id, menu=expected["menus"], parent=expected["parent"])
+    return {"id": new_id, "entree": _item_view(check), "parent": check.get("parent"),
+            "ordre": check.get("menu_order"),
+            "annuler": f"wp_menu_entree_preparer(id={new_id}, masquer=True)"}
+
+
 # ======================================================================= textes alternatifs
 @mcp.tool()
 async def wp_medias_alt_preparer(elements: list[dict[str, Any]]) -> dict[str, Any]:
@@ -969,6 +1072,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "medias_alt": _exec_medias_alt,
     "page_regenerer": _exec_page_regenerer,
     "page_modele": _exec_page_modele,
+    "menu_entree_ajouter": _exec_menu_entree_ajouter,
 }
 
 
