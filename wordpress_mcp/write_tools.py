@@ -1,7 +1,7 @@
 """Outils d'écriture (v2) : préparer → aperçu → confirmer. Voir writes.py pour les verrous.
 
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
-wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
+wp_page_creer_preparer, wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
 wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
@@ -783,6 +783,61 @@ async def _exec_page_modele(client: WordPressClient, gate: WriteGate, p: Pending
 PAGE_STATUSES = {"publish": "publié", "draft": "brouillon", "private": "privé", "pending": "en attente de relecture"}
 
 
+@mcp.tool()
+async def wp_page_creer_preparer(titre: str, slug: str | None = None, parent: int = 0) -> dict[str, Any]:
+    """PRÉPARE la création d'une page vide **en brouillon** (invisible du public) ; n'écrit rien.
+    `titre` : titre de la page ; `slug` : adresse souhaitée (ex. « applications-de-l-ecole »,
+    sinon tirée du titre à la publication) ; `parent` : page parente (0 = aucune). Étapes suivantes :
+    mise en page avec wp_page_modele_preparer, relecture, puis publication avec
+    wp_page_preparer(statut='publish'). Aucune page n'est jamais créée publiée."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    title = (titre or "").strip()
+    if not title:
+        raise WordPressError("`titre` obligatoire", code="parametre")
+    payload: dict[str, Any] = {"title": title, "status": "draft"}
+    if slug:
+        s = slug.strip().strip("/").lower()
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", s):
+            raise WordPressError(f"slug invalide : « {slug} » (minuscules, chiffres et tirets)", code="parametre")
+        payload["slug"] = s
+    if parent:
+        par = await client.get(f"/wp/v2/pages/{int(parent)}", {"context": "edit"})
+        payload["parent"] = int(par["id"])
+    existing = await client.get_all("/wp/v2/pages", {"context": "edit", "search": title,
+                                                     "status": "publish,draft,pending,private"})
+    same = [p for p in existing if html.unescape(_raw(p.get("title"))).strip().lower() == title.lower()]
+    if same:
+        raise WordPressError("une page porte déjà ce titre : " + ", ".join(
+            f"{p['id']} ({PAGE_STATUSES.get(p.get('status'), p.get('status'))})" for p in same)
+            + " — la réutiliser plutôt que d'en créer une autre", code="deja_present")
+    preview = {"titre": title, "statut": "brouillon (invisible du public)",
+               "adresse_souhaitee": payload.get("slug", "tirée du titre à la publication"),
+               "parent": payload.get("parent", 0)}
+    return gate.prepare("page_creer", {"payload": payload},
+                        summary=f"Créer la page « {title} » en brouillon", preview=preview,
+                        guard={"titre": title.lower()},
+                        warnings=["La page est créée vide et en brouillon : rien n'apparaît sur le site public."])
+
+
+async def _exec_page_creer(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    title = p.args["payload"]["title"]
+    existing = await client.get_all("/wp/v2/pages", {"context": "edit", "search": title,
+                                                     "status": "publish,draft,pending,private"})
+    if any(html.unescape(_raw(x.get("title"))).strip().lower() == p.guard.get("titre") for x in existing):
+        raise WordPressError("une page portant ce titre a été créée entre-temps : écriture annulée",
+                             code="deja_present")
+    data = await client.write("POST", "/wp/v2/pages", json=p.args["payload"])
+    if data.get("status") != "draft":
+        raise WordPressError(f"page {data.get('id')} créée avec le statut {data.get('status')} : la vérifier",
+                             code="verification_echouee")
+    gate.journal("page_creer", True, id=data.get("id"))
+    return {"id": data.get("id"), "titre": _raw(data.get("title")), "statut": "brouillon",
+            "apercu": f"{client.settings.base_url.rstrip('/')}/?page_id={data.get('id')}&preview=true",
+            "etape_suivante": f"wp_page_modele_preparer(id={data.get('id')}, modele_id=…, textes=…)"}
+
+
 async def _menus_pointing_to(client: WordPressClient, item_id: int) -> list[str]:
     try:
         menus = {m["id"]: html.unescape(m.get("name", "")) for m in await client.get_all("/wp/v2/menus")}
@@ -1073,6 +1128,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "page_regenerer": _exec_page_regenerer,
     "page_modele": _exec_page_modele,
     "menu_entree_ajouter": _exec_menu_entree_ajouter,
+    "page_creer": _exec_page_creer,
 }
 
 

@@ -74,7 +74,7 @@ Variables d'environnement :
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
 
-## Outils d'écriture (15, avec `WP_ENABLE_WRITES=1`)
+## Outils d'écriture (16, avec `WP_ENABLE_WRITES=1`)
 
 | Outil | Rôle |
 |---|---|
@@ -82,7 +82,8 @@ Variables d'environnement :
 | `wp_widget_texte_preparer` | remplacer le texte d'un widget Elementor (`title`, `editor`, `icon_list.2.text`…) d'une page ou d'un article — en entier, ou seulement un extrait avec `remplacer` (le reste du bloc et sa mise en forme sont conservés ; espaces insécables et apostrophes tolérés) ; sauvegarde locale de l'ancien contenu, relecture, vidage du cache Elementor |
 | `wp_page_restaurer_preparer` | revenir à une sauvegarde locale (le contenu actuel est sauvegardé avant) |
 | `wp_page_regenerer_preparer` | équivalent du bouton « Mettre à jour » d'Elementor : régénère le texte de secours d'une page Elementor (recherche, flux RSS, résumé affiché au partage du lien) à partir de son contenu, puis vide le cache Elementor ; le contenu affiché ne change pas. `wp_widget_texte_preparer` le fait aussi automatiquement quand l'ancien texte ne peut pas être remplacé directement |
-| `wp_page_modele_preparer` | reprendre la mise en page Elementor d'une page modèle dans une page existante **en brouillon** (créée au préalable dans wp-admin) : structure copiée avec de nouveaux identifiants, `textes={widget du modèle: texte}` pour remplir titres et blocs en une seule écriture, `exclure=[…]` pour laisser des éléments de côté ; métas Elementor (`builder`, type de modèle, réglages de page) et texte de secours posés, cache vidé ; refusé sur une page publiée. Pour mettre une page V3 en forme sans Elementor ni éditeur V4 |
+| `wp_page_creer_preparer` | créer une page vide, **toujours en brouillon** (titre, adresse souhaitée, page parente) ; refuse un titre déjà utilisé. À enchaîner avec `wp_page_modele_preparer`, puis publication par `wp_page_preparer` |
+| `wp_page_modele_preparer` | reprendre la mise en page Elementor d'une page modèle dans une page existante **en brouillon** (créée avec `wp_page_creer_preparer` ou dans wp-admin) : structure copiée avec de nouveaux identifiants, `textes={widget du modèle: texte}` pour remplir titres et blocs en une seule écriture, `exclure=[…]` pour laisser des éléments de côté ; métas Elementor (`builder`, type de modèle, réglages de page) et texte de secours posés, cache vidé ; refusé sur une page publiée. Pour mettre une page V3 en forme sans Elementor ni éditeur V4 |
 | `wp_page_preparer` | changer le titre et/ou le statut d'une page ou d'un article existant (brouillon, privé, en attente, publié) ; signale les entrées de menu qui pointent vers la page |
 | `wp_menu_entree_preparer` | modifier une entrée de menu : la faire pointer vers une autre page publiée ou une adresse, changer son libellé, la masquer (statut brouillon, réversible) |
 | `wp_menu_entree_ajouter_preparer` | ajouter une entrée à un menu existant (identifiant, nom ou slug) : page publiée (libellé = son titre par défaut) ou lien personnalisé, au premier niveau ou sous une entrée (`parent`), en dernier ou après une entrée sœur (`apres`) ; refuse un doublon au même endroit ; relecture après création. Pour la retirer : `wp_menu_entree_preparer(masquer=True)` |
@@ -96,7 +97,7 @@ Variables d'environnement :
 Verrous (`writes.py`, `client.py`) :
 1. `WP_ENABLE_WRITES=1` obligatoire, sinon même la préparation est refusée.
 2. Jeton aléatoire, à usage unique, valable 10 minutes ; l'écriture exécutée est exactement celle de l'aperçu.
-3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor. Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
+3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor. Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
 4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, statut, empreinte du contenu, de l'entrée de menu, des textes d'une image ou du fichier), l'écriture est refusée.
 5. Les erreurs du connecteur héritent de `ToolError` : leur message (extrait introuvable, jeton expiré, page modifiée entre-temps…) est transmis au modèle au lieu d'un « Error executing tool » muet.
 6. Avant toute modification d'un contenu Elementor : sauvegarde JSON dans `WP_BACKUP_DIR` ; après : relecture et comparaison. Journal `journal.jsonl` (date, opération, identifiants, issue — jamais le contenu).

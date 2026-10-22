@@ -41,7 +41,7 @@ def _writes():
                                          ("POST", "/wp/v2/media/9"), ("POST", "/redirection/v1/redirect"),
                                          ("POST", "/redirection/v1/bulk/redirect/disable"),
                                          ("DELETE", "/elementor/v1/cache"), ("POST", "/wp/v2/menu-items/765"),
-                                         ("POST", "/wp/v2/menu-items")])
+                                         ("POST", "/wp/v2/menu-items"), ("POST", "/wp/v2/pages")])
 def test_allowed_writes(method, path):
     check_write_allowed(method, path)
 
@@ -50,7 +50,7 @@ def test_allowed_writes(method, path):
                                          ("POST", "/wp/v2/users"), ("POST", "/wp/v2/plugins"),
                                          ("POST", "/wp/v2/settings"), ("PUT", "/wp/v2/pages/644"),
                                          ("POST", "/redirection/v1/bulk/redirect/delete"),
-                                         ("POST", "/wp/v2/pages"), ("POST", "/wp/v2/posts/12/../../users"),
+                                         ("POST", "/wp/v2/pages/644/revisions"), ("POST", "/wp/v2/posts/12/../../users"),
                                          ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x"),
                                          ("DELETE", "/wp/v2/menu-items/765"), ("POST", "/wp/v2/menu-items/765/../1"),
                                          ("POST", "/wp/v2/menus/5")])
@@ -646,3 +646,33 @@ async def test_menu_entry_add_under_parent(writes_on):
     with pytest.raises(WordPressError) as e:
         await WT.wp_ecriture_confirmer(prep["jeton"])
     assert e.value.code == "modifie_entre_temps" and post.call_count == 1
+
+
+# ------------------------------------------------------------------ création d'une page (brouillon)
+@respx.mock
+async def test_page_create_draft(writes_on):
+    pages = [{"id": 1884, "status": "publish", "title": {"raw": "Menus de la cantine"}}]
+    respx.get(f"{BASE}/wp-json/wp/v2/pages").mock(side_effect=lambda r: httpx.Response(200, json=pages))
+    def create(request):
+        body = json.loads(request.content)
+        new = {"id": 1900, "status": body["status"], "title": {"raw": body["title"]}}
+        pages.append(new)
+        return httpx.Response(201, json=new)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages").mock(side_effect=create)
+    prep = await WT.wp_page_creer_preparer("Applications de l'école", slug="applications-de-l-ecole")
+    assert prep["apercu"]["statut"].startswith("brouillon") and not _writes()
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert json.loads(post.calls.last.request.content) == {"title": "Applications de l'école", "status": "draft",
+                                                           "slug": "applications-de-l-ecole"}
+    assert out["id"] == 1900 and out["statut"] == "brouillon" and "page_id=1900" in out["apercu"]
+    for args, kw, code in [(("Menus de la cantine",), {}, "deja_present"), (("",), {}, "parametre"),
+                           (("Autre",), {"slug": "Pas Bon!"}, "parametre")]:
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_page_creer_preparer(*args, **kw)
+        assert e.value.code == code
+    # même titre créé entre l'aperçu et la confirmation
+    prep = await WT.wp_page_creer_preparer("Contact")
+    pages.append({"id": 1901, "status": "draft", "title": {"raw": "Contact"}})
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "deja_present" and post.call_count == 1
