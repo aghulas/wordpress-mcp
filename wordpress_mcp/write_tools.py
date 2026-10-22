@@ -3,7 +3,8 @@
 Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_preparer,
 wp_page_creer_preparer, wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
 wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer,
-wp_redirection_preparer, wp_redirection_activer_preparer, wp_ecriture_confirmer,
+wp_redirection_preparer, wp_redirection_activer_preparer, wp_snippet_installer_preparer,
+wp_snippet_activer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
 
 Chaque *_preparer ne fait que des lectures ; l'écriture n'a lieu que dans un exécuteur
@@ -12,11 +13,14 @@ Chaque *_preparer ne fait que des lectures ; l'écriture n'a lieu que dans un ex
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import html
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote, urlsplit
@@ -851,16 +855,18 @@ async def _menus_pointing_to(client: WordPressClient, item_id: int) -> list[str]
 
 @mcp.tool()
 async def wp_page_preparer(id: int, titre: str | None = None, statut: str | None = None,
-                           type_contenu: str = "page") -> dict[str, Any]:
-    """PRÉPARE le changement du titre et/ou du statut d'une page (ou d'un article) existante ;
-    n'écrit rien. `statut` : draft (brouillon : la page n'est plus visible, rien n'est supprimé),
-    private, pending, publish. Signale les entrées de menu qui pointent vers la page."""
+                           type_contenu: str = "page", slug: str | None = None) -> dict[str, Any]:
+    """PRÉPARE le changement du titre, du statut et/ou de l'adresse (`slug`) d'une page (ou d'un
+    article) existante ; n'écrit rien. `statut` : draft (brouillon : la page n'est plus visible,
+    rien n'est supprimé), private, pending, publish. `slug` : nouvelle fin d'adresse (ex. « ogec ») ;
+    les menus suivent automatiquement, mais l'ancienne adresse ne fonctionne plus : prévoir une
+    redirection (wp_redirection_preparer). Signale les entrées de menu qui pointent vers la page."""
     gate = _get_gate()
     gate.ensure_enabled()
     client = _get_client()
     path = _content_path(type_contenu, id)
-    if titre is None and statut is None:
-        raise WordPressError("indiquer `titre` et/ou `statut`", code="parametre")
+    if titre is None and statut is None and slug is None:
+        raise WordPressError("indiquer `titre`, `statut` et/ou `slug`", code="parametre")
     if statut is not None and statut not in PAGE_STATUSES:
         raise WordPressError(f"statut inconnu : {statut} ({', '.join(PAGE_STATUSES)})", code="parametre")
     cur = await client.get(path, {"context": "edit"})
@@ -873,9 +879,31 @@ async def wp_page_preparer(id: int, titre: str | None = None, statut: str | None
         payload["status"] = statut
         changes["statut"] = {"avant": PAGE_STATUSES.get(cur.get("status"), cur.get("status")),
                              "apres": PAGE_STATUSES[statut]}
+    warnings = []
+    if slug is not None:
+        s = slug.strip().strip("/").lower()
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", s):
+            raise WordPressError(f"slug invalide : « {slug} » (minuscules, chiffres et tirets)", code="parametre")
+        if s != cur.get("slug"):
+            base = CONTENT_PATHS[type_contenu]
+            taken = [x for x in await client.get_all(base, {"context": "edit", "slug": s,
+                                                            "status": "publish,draft,pending,private"})
+                     if int(x.get("id")) != int(id)]
+            if taken:
+                raise WordPressError(f"l'adresse « {s} » est déjà utilisée par {type_contenu} {taken[0]['id']} "
+                                     f"(« {html.unescape(_raw(taken[0].get('title')))} »)", code="deja_present")
+            payload["slug"] = s
+            old_link = cur.get("link") or ""
+            changes["adresse"] = {"avant": old_link, "apres": old_link.rstrip("/").rsplit("/", 1)[0] + "/" + s
+                                  if cur.get("status") == "publish" else s}
+            if cur.get("status") == "publish":
+                old_path = urlsplit(old_link).path or f"/{cur.get('slug')}"
+                warnings.append(f"L'ancienne adresse {old_path} ne fonctionnera plus : créer une redirection "
+                                f"(wp_redirection_preparer(source='{old_path.rstrip('/')}', cible='/{s}')). "
+                                "Les entrées de menu suivent automatiquement ; les liens écrits à la main dans "
+                                "les textes, eux, sont à corriger.")
     if not payload:
         raise WordPressError("aucun changement", code="aucun_changement")
-    warnings = []
     if cur.get("status") == "publish" and statut and statut != "publish":
         menus = await _menus_pointing_to(client, int(id))
         warnings.append("La page ne sera plus visible du public ; ses liens renverront une erreur 404.")
@@ -1115,6 +1143,205 @@ async def _exec_medias_alt(client: WordPressClient, gate: WriteGate, p: PendingW
 
 
 # ======================================================================= confirmation
+# ------------------------------------------------------------------ snippets WPCode
+SNIPPET_FILE_RE = re.compile(r"wpcode-snippet-[a-z0-9]+(?:-[a-z0-9]+)*\.php")
+SNIPPETS_PROTECTED = {"MCP Gestion des snippets", "MCP Auth"}
+SNIPPET_MAX_BYTES = 64 * 1024
+SNIPPET_PREVIEW_MAX = 40_000
+SNIPPETS_HINT = ("routes de gestion des snippets absentes : installer une fois docs/wpcode-snippet-gestion.php "
+                 "dans WPCode (titre « MCP Gestion des snippets », « Exécuter partout », Activer)")
+
+
+def _sha(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _snippet_file(client: WordPressClient, fichier: str) -> tuple[str, str]:
+    """Lit un snippet relu du dossier des snippets : (code sans « <?php », sha256). Seul un nom simple
+    wpcode-snippet-xxx.php est accepté (pas de chemin) ; vérifié avec `php -l` si PHP est présent."""
+    name = (fichier or "").strip()
+    if not SNIPPET_FILE_RE.fullmatch(name):
+        raise WordPressError(f"fichier refusé : « {fichier} » — nom simple attendu (wpcode-snippet-xxx.php), "
+                             "pris dans le dossier des snippets relus du connecteur", code="parametre")
+    base = Path(client.settings.snippets_dir).expanduser().resolve()
+    path = (base / name).resolve()
+    if path.parent != base or not path.is_file():
+        raise WordPressError(f"{name} introuvable dans {base}", code="introuvable")
+    if path.stat().st_size > SNIPPET_MAX_BYTES:
+        raise WordPressError(f"{name} dépasse {SNIPPET_MAX_BYTES // 1024} Ko", code="trop_volumineux")
+    raw = path.read_text(encoding="utf-8")
+    code = re.sub(r"\A﻿?\s*<\?php[ \t]*(?:\r?\n)?", "", raw, count=1).lstrip("\r\n")
+    if not code.strip():
+        raise WordPressError(f"{name} est vide", code="parametre")
+    if re.match(r"\s*<\?php", code):
+        raise WordPressError(f"{name} : balise <?php en double", code="parametre")
+    php = shutil.which("php")
+    if php:
+        res = subprocess.run([php, "-l", str(path)], capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            raise WordPressError(f"{name} : erreur de syntaxe PHP — {(res.stdout or res.stderr).strip()[:400]}",
+                                 code="syntaxe_php")
+    return code, _sha(code)
+
+
+async def _snippets_get(client: WordPressClient, path: str = "") -> Any:
+    try:
+        return await client.get("/wpmcp/v1/snippets" + path)
+    except WordPressError as e:
+        if e.code == "rest_no_route" or (e.status == 404 and not path):
+            raise WordPressError(SNIPPETS_HINT, code="snippets_indisponibles") from e
+        raise
+
+
+def _snippet_brief(sn: dict[str, Any]) -> dict[str, Any]:
+    return {k: sn.get(k) for k in ("id", "titre", "actif", "type", "emplacement", "modifie", "taille", "sha256")}
+
+
+@mcp.tool()
+async def wp_snippet_installer_preparer(fichier: str, titre: str) -> dict[str, Any]:
+    """PRÉPARE l'installation d'un snippet WPCode PHP depuis un fichier **relu** du dossier des snippets
+    du connecteur (docs/ par défaut : `fichier` = nom simple, ex. « wpcode-snippet-securite.php ») ;
+    n'écrit rien. `titre` doit commencer par « MCP ». S'il n'existe pas de snippet de ce titre : création
+    **inactive** (aperçu = code complet ; activer ensuite avec wp_snippet_activer_preparer). S'il existe :
+    remplacement de son code (aperçu = différences complètes ; s'il est actif, le nouveau code s'applique
+    dès la confirmation, après le test de WPCode). Jamais de code saisi dans la conversation."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    title = (titre or "").strip()
+    if not title.startswith("MCP ") or len(title) < 5:
+        raise WordPressError("le titre doit commencer par « MCP » (ex. « MCP Sécurité »)", code="parametre")
+    if title in SNIPPETS_PROTECTED:
+        raise WordPressError(f"« {title} » se met à jour à la main dans WPCode (il porte l'accès du connecteur)",
+                             code="snippet_protege")
+    code, sha = _snippet_file(client, fichier)
+    items = await _snippets_get(client)
+    same = [sn for sn in items or [] if (sn.get("titre") or "").strip() == title]
+    if not same:
+        if len(code) > SNIPPET_PREVIEW_MAX:
+            raise WordPressError("code trop long pour être montré en entier dans l'aperçu", code="trop_volumineux")
+        preview = {"operation": "création (inactif)", "titre": title, "fichier": fichier, "type": "PHP",
+                   "emplacement": "Exécuter partout", "taille": len(code.encode("utf-8")), "sha256": sha,
+                   "code_complet": code}
+        return gate.prepare("snippet_installer", {"mode": "creation", "fichier": fichier, "titre": title,
+                                                  "code": code, "sha256": sha},
+                            summary=f"Créer le snippet WPCode « {title} » (inactif) depuis {fichier}",
+                            preview=preview, guard={"titre": title},
+                            warnings=["Le snippet est créé INACTIF : rien ne change sur le site avant "
+                                      "wp_snippet_activer_preparer.",
+                                      "Relire le code complet de l'aperçu avant de confirmer."])
+    cur = await _snippets_get(client, f"/{int(same[0]['id'])}")
+    if cur.get("sha256") == sha:
+        raise WordPressError(f"le snippet {cur['id']} « {title} » a déjà exactement ce code", code="deja_a_jour")
+    diff = "".join(difflib.unified_diff((cur.get("code") or "").splitlines(keepends=True),
+                                        code.splitlines(keepends=True),
+                                        fromfile=f"en ligne (snippet {cur['id']})", tofile=fichier, n=2))
+    if len(diff) > SNIPPET_PREVIEW_MAX:
+        raise WordPressError("différences trop longues pour être montrées en entier dans l'aperçu",
+                             code="trop_volumineux")
+    preview = {"operation": "remplacement du code", "id": cur["id"], "titre": title, "fichier": fichier,
+               "actif": bool(cur.get("actif")), "sha256_avant": cur.get("sha256"), "sha256_apres": sha,
+               "differences": diff}
+    warnings = ["L'ancien code est sauvegardé localement avant le remplacement."]
+    if cur.get("actif"):
+        warnings.insert(0, "Snippet ACTIF : le nouveau code s'applique à tout le site dès la confirmation "
+                           "(WPCode le teste d'abord et désactive le snippet s'il est en erreur). Vider ensuite "
+                           "le cache WP Super Cache.")
+    return gate.prepare("snippet_installer", {"mode": "maj", "id": int(cur["id"]), "fichier": fichier,
+                                              "titre": title, "code": code, "sha256": sha},
+                        summary=f"Remplacer le code du snippet {cur['id']} « {title} » par {fichier}",
+                        preview=preview, guard={"sha256_actuel": cur.get("sha256"), "actif": bool(cur.get("actif"))},
+                        warnings=warnings)
+
+
+def _check_snippet_result(data: dict[str, Any], sha: str) -> None:
+    if data.get("sha256") != sha or data.get("integre") is False:
+        raise WordPressError(f"snippet {data.get('id')} enregistré mais son code diffère du fichier "
+                             "(empreinte) : le vérifier dans WPCode", code="verification_echouee")
+
+
+async def _exec_snippet_installer(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    a = p.args
+    code, sha = _snippet_file(client, a["fichier"])
+    if sha != a["sha256"]:
+        raise WordPressError(f"{a['fichier']} a changé depuis l'aperçu : écriture annulée, préparer à nouveau",
+                             code="modifie_entre_temps")
+    if a["mode"] == "creation":
+        items = await _snippets_get(client)
+        if any((sn.get("titre") or "").strip() == a["titre"] for sn in items or []):
+            raise WordPressError("un snippet de ce titre a été créé entre-temps : écriture annulée",
+                                 code="deja_present")
+        data = await client.write("POST", "/wpmcp/v1/snippets",
+                                  json={"titre": a["titre"], "code": code, "sha256": sha})
+        _check_snippet_result(data, sha)
+        if data.get("actif"):
+            raise WordPressError(f"snippet {data.get('id')} créé actif : le vérifier", code="verification_echouee")
+        gate.journal("snippet_installer", True, id=data.get("id"), titre=a["titre"], sha256=sha)
+        return {"snippet": _snippet_brief(data), "statut": "créé, inactif",
+                "etape_suivante": f"wp_snippet_activer_preparer(id={data.get('id')}, actif=True)"}
+    cur = await _snippets_get(client, f"/{a['id']}")
+    if cur.get("sha256") != p.guard.get("sha256_actuel") or bool(cur.get("actif")) != p.guard.get("actif"):
+        raise WordPressError("le snippet a changé depuis l'aperçu : écriture annulée, préparer à nouveau",
+                             code="modifie_entre_temps")
+    backup = gate.save_backup("snippet", a["id"], {"titre": cur.get("titre"), "actif": cur.get("actif"),
+                                                   "sha256": cur.get("sha256"), "code": cur.get("code")})
+    data = await client.write("POST", f"/wpmcp/v1/snippets/{a['id']}",
+                              json={"code": code, "sha256": sha, "sha256_actuel": cur.get("sha256")})
+    _check_snippet_result(data, sha)
+    gate.journal("snippet_installer", True, id=a["id"], sha256=sha, sauvegarde=backup)
+    out = {"snippet": _snippet_brief(data), "sauvegarde": backup,
+           "statut": "code remplacé" + (", actif" if data.get("actif") else ", inactif")}
+    if data.get("avertissement"):
+        out["avertissement"] = data["avertissement"]
+    return out
+
+
+@mcp.tool()
+async def wp_snippet_activer_preparer(id: int, actif: bool) -> dict[str, Any]:
+    """PRÉPARE l'activation (`actif=True`) ou la désactivation (`actif=False`) d'un snippet WPCode
+    (identifiants : wp_snippets) ; n'écrit rien. À l'activation, WPCode teste le code et refuse s'il est
+    en erreur. « MCP Gestion des snippets » et « MCP Auth » ne peuvent pas être désactivés à distance."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    cur = await _snippets_get(client, f"/{int(id)}")
+    want = bool(actif)
+    if bool(cur.get("actif")) == want:
+        raise WordPressError(f"le snippet {cur['id']} est déjà {'actif' if want else 'inactif'}", code="deja_a_jour")
+    if not want and (cur.get("protege") or (cur.get("titre") or "").strip() in SNIPPETS_PROTECTED):
+        raise WordPressError(f"« {cur.get('titre')} » ne peut pas être désactivé à distance (il porte l'accès du "
+                             "connecteur) : le faire dans WPCode si nécessaire", code="snippet_protege")
+    preview: dict[str, Any] = {**_snippet_brief(cur), "actif": {"avant": bool(cur.get("actif")), "apres": want}}
+    code = cur.get("code") or ""
+    if want:
+        preview["code_complet" if len(code) <= SNIPPET_PREVIEW_MAX else "debut_du_code"] = code[:SNIPPET_PREVIEW_MAX]
+        warnings = ["Le code s'exécute sur tout le site dès la confirmation (WPCode le teste d'abord et refuse "
+                    "l'activation s'il est en erreur).",
+                    "Vider ensuite le cache WP Super Cache pour que les pages en cache en tiennent compte."]
+    else:
+        warnings = ["Les fonctions de ce snippet s'arrêtent dès la confirmation (réversible)."]
+    return gate.prepare("snippet_activer", {"id": int(cur["id"]), "actif": want},
+                        summary=f"{'Activer' if want else 'Désactiver'} le snippet {cur['id']} « {cur.get('titre')} »",
+                        preview=preview, guard={"sha256": cur.get("sha256"), "actif": bool(cur.get("actif"))},
+                        warnings=warnings)
+
+
+async def _exec_snippet_activer(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    sid, want = p.args["id"], p.args["actif"]
+    cur = await _snippets_get(client, f"/{sid}")
+    if cur.get("sha256") != p.guard.get("sha256") or bool(cur.get("actif")) != p.guard.get("actif"):
+        raise WordPressError("le snippet a changé depuis l'aperçu : écriture annulée, préparer à nouveau",
+                             code="modifie_entre_temps")
+    data = await client.write("POST", f"/wpmcp/v1/snippets/{sid}/statut", json={"actif": want})
+    if bool(data.get("actif")) != want:
+        raise WordPressError(f"le snippet {sid} est resté {'actif' if data.get('actif') else 'inactif'}",
+                             code="verification_echouee")
+    _check_snippet_result(data, p.guard.get("sha256"))
+    gate.journal("snippet_activer", True, id=sid, actif=want)
+    return {"snippet": _snippet_brief(data), "statut": "activé" if want else "désactivé",
+            "a_faire": "vider le cache WP Super Cache puis vérifier le site" if want else None}
+
+
 EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaitable[dict[str, Any]]]] = {
     "article": _exec_article,
     "widget_texte": _exec_widget_texte,
@@ -1129,6 +1356,8 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "page_modele": _exec_page_modele,
     "menu_entree_ajouter": _exec_menu_entree_ajouter,
     "page_creer": _exec_page_creer,
+    "snippet_installer": _exec_snippet_installer,
+    "snippet_activer": _exec_snippet_activer,
 }
 
 

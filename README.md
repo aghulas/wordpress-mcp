@@ -37,6 +37,7 @@ Variables d'environnement :
 | `WP_BACKUP_DIR` | sauvegardes locales des pages modifiées et journal des écritures (défaut `~/.wordpress-mcp/sauvegardes`) |
 | `WP_UPLOAD_ROOTS` | dossiers d'où un fichier peut être envoyé, séparés par `:` (défaut `~/Documents:~/Downloads:~/Desktop`) |
 | `WP_UPLOAD_MAX_MB` | taille maximale d'un fichier envoyé (défaut 20) |
+| `WP_SNIPPETS_DIR` | dossier des snippets WPCode relus (`wpcode-snippet-*.php`) que le connecteur peut installer (défaut : `docs/` du connecteur) |
 
 `claude_desktop_config.json` :
 
@@ -70,6 +71,7 @@ Variables d'environnement :
 | `wp_evenements` | événements Modern Events Calendar ; dates lues dans le JSON-LD de la page publique | non | ✔ |
 | `wp_formulaires_soumissions` | réponses aux formulaires Forminator (avec le snippet `docs/wpcode-snippet-forminator.php`) et Elementor Pro | admin | ✔ (snippet à installer) |
 | `wp_redirections` | règles Redirection et journal des 404 | oui | ✔ |
+| `wp_snippets` | snippets WPCode : titre, actif, type, emplacement, empreinte SHA-256 du code, protégé, erreur (avec le snippet `docs/wpcode-snippet-gestion.php`) | admin | ✔ (snippet à installer) |
 | `wp_extensions` | extensions installées, inactives, thème actif | admin | ✔ |
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
@@ -84,20 +86,22 @@ Variables d'environnement :
 | `wp_page_regenerer_preparer` | équivalent du bouton « Mettre à jour » d'Elementor : régénère le texte de secours d'une page Elementor (recherche, flux RSS, résumé affiché au partage du lien) à partir de son contenu, puis vide le cache Elementor ; le contenu affiché ne change pas. `wp_widget_texte_preparer` le fait aussi automatiquement quand l'ancien texte ne peut pas être remplacé directement |
 | `wp_page_creer_preparer` | créer une page vide, **toujours en brouillon** (titre, adresse souhaitée, page parente) ; refuse un titre déjà utilisé. À enchaîner avec `wp_page_modele_preparer`, puis publication par `wp_page_preparer` |
 | `wp_page_modele_preparer` | reprendre la mise en page Elementor d'une page modèle dans une page existante **en brouillon** (créée avec `wp_page_creer_preparer` ou dans wp-admin) : structure copiée avec de nouveaux identifiants, `textes={widget du modèle: texte}` pour remplir titres et blocs en une seule écriture, `exclure=[…]` pour laisser des éléments de côté ; métas Elementor (`builder`, type de modèle, réglages de page) et texte de secours posés, cache vidé ; refusé sur une page publiée. Pour mettre une page V3 en forme sans Elementor ni éditeur V4 |
-| `wp_page_preparer` | changer le titre et/ou le statut d'une page ou d'un article existant (brouillon, privé, en attente, publié) ; signale les entrées de menu qui pointent vers la page |
+| `wp_page_preparer` | changer le titre, le statut (brouillon, privé, en attente, publié) et/ou l'adresse (`slug`, refusée si déjà prise ; rappel de créer la redirection de l'ancienne adresse) d'une page ou d'un article existant ; signale les entrées de menu qui pointent vers la page |
 | `wp_menu_entree_preparer` | modifier une entrée de menu : la faire pointer vers une autre page publiée ou une adresse, changer son libellé, la masquer (statut brouillon, réversible) |
 | `wp_menu_entree_ajouter_preparer` | ajouter une entrée à un menu existant (identifiant, nom ou slug) : page publiée (libellé = son titre par défaut) ou lien personnalisé, au premier niveau ou sous une entrée (`parent`), en dernier ou après une entrée sœur (`apres`) ; refuse un doublon au même endroit ; relecture après création. Pour la retirer : `wp_menu_entree_preparer(masquer=True)` |
 | `wp_medias_alt_preparer` | textes alternatifs (et titres, légendes) de 1 à 50 images en une fois |
 | `wp_media_envoyer_preparer` | envoyer une image (JPG, PNG, GIF, WEBP) ou un PDF du poste dans la médiathèque, avec titre, texte alternatif, légende |
 | `wp_redirection_preparer` | créer une règle de l'extension Redirection (301, 302, 307, 308) |
 | `wp_redirection_activer_preparer` | activer ou désactiver des règles (jamais de suppression) |
+| `wp_snippet_installer_preparer` | installer un snippet WPCode PHP « MCP … » **depuis un fichier relu** du dossier `WP_SNIPPETS_DIR` (nom simple `wpcode-snippet-xxx.php`, vérifié par `php -l`) : création **inactive** avec le code complet dans l'aperçu, ou remplacement du code d'un snippet existant de même titre avec les différences complètes et sauvegarde de l'ancien code ; refusé si le fichier change entre l'aperçu et la confirmation. Jamais de code saisi dans la conversation |
+| `wp_snippet_activer_preparer` | activer (WPCode teste le code et refuse s'il est en erreur) ou désactiver un snippet ; « MCP Gestion des snippets » et « MCP Auth » ne peuvent pas être désactivés à distance |
 | `wp_ecriture_confirmer` | exécuter une écriture préparée, après accord explicite de l'utilisateur |
 | `wp_ecriture_annuler` / `wp_ecritures_en_attente` | abandonner une écriture préparée / lister celles en attente |
 
 Verrous (`writes.py`, `client.py`) :
 1. `WP_ENABLE_WRITES=1` obligatoire, sinon même la préparation est refusée.
 2. Jeton aléatoire, à usage unique, valable 10 minutes ; l'écriture exécutée est exactement celle de l'aperçu.
-3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor. Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
+3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor, création, mise à jour et activation de snippets WPCode « MCP … » (routes `wpmcp/v1/snippets` du snippet de gestion). Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
 4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, statut, empreinte du contenu, de l'entrée de menu, des textes d'une image ou du fichier), l'écriture est refusée.
 5. Les erreurs du connecteur héritent de `ToolError` : leur message (extrait introuvable, jeton expiré, page modifiée entre-temps…) est transmis au modèle au lieu d'un « Error executing tool » muet.
 6. Avant toute modification d'un contenu Elementor : sauvegarde JSON dans `WP_BACKUP_DIR` ; après : relecture et comparaison. Journal `journal.jsonl` (date, opération, identifiants, issue — jamais le contenu).
@@ -119,6 +123,7 @@ Sans identifiants (`WP_USER` absent), le serveur fonctionne en anonyme : contenu
 
 - **Événements MEC** : MEC Lite range les dates dans sa propre table, hors de l'API REST ; `wp_evenements` les lit dans le JSON-LD (`schema.org/Event`) de chaque page publique d'événement.
 - **Formulaires** : le site utilise **Forminator**, qui n'expose pas ses réponses en REST. Le snippet `docs/wpcode-snippet-forminator.php` (WPCode, à côté de celui d'authentification) ajoute deux routes en lecture seule, réservées aux administrateurs (`wpmcp/v1/forminator/forms` et `…/forms/<id>/entries`), qui passent par l'API PHP de Forminator et ne renvoient pas l'adresse IP. Sans lui, `wp_formulaires_soumissions` le signale dans `notes`. Les formulaires Elementor Pro, s'il y en a, sont lus en plus.
+- **Snippets WPCode** : WPCode n'a pas d'API REST. Le snippet `docs/wpcode-snippet-gestion.php` (à installer une fois à la main, titre « MCP Gestion des snippets », « Exécuter partout ») ajoute les routes `wpmcp/v1/snippets` réservées aux administrateurs ayant `unfiltered_html` : lecture, création de snippets PHP « MCP … » toujours inactifs, remplacement du code (empreinte SHA-256 vérifiée, refus si le code a changé depuis la lecture), activation/désactivation par l'API de WPCode (test du code avant activation). WPCode enregistre le code sans le protéger des antislashs : le snippet impose le code exact pendant l'enregistrement et renvoie `integre`. Aucune suppression ; désactiver ce snippet dans WPCode coupe l'accès.
 
 ## Pages Elementor
 

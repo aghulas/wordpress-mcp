@@ -447,6 +447,26 @@ def _forminator_labels(champs: list[dict]) -> dict[str, str]:
     return out
 
 
+SNIPPETS_GESTION = "docs/wpcode-snippet-gestion.php"
+
+
+@mcp.tool()
+async def wp_snippets() -> dict[str, Any]:
+    """Snippets WPCode du site : id, titre, actif, type, emplacement, empreinte SHA-256 du code,
+    protégé (ne peut pas être désactivé à distance), erreur signalée par WPCode. Nécessite le
+    snippet docs/wpcode-snippet-gestion.php côté site (WPCode n'a pas d'API REST)."""
+    client = _get_client()
+    try:
+        items = await client.get("/wpmcp/v1/snippets")
+    except WordPressError as e:
+        if e.code == "rest_no_route" or e.status == 404:
+            return {"snippets": [], "note": f"snippets non lisibles : installer {SNIPPETS_GESTION} dans WPCode "
+                                            "(titre « MCP Gestion des snippets »)"}
+        raise
+    return {"nombre": len(items or []), "actifs": sum(1 for i in items or [] if i.get("actif")),
+            "snippets": items or []}
+
+
 async def _forminator_submissions(client: WordPressClient, form_id: int | None, depuis: str | None,
                                   limite: int) -> tuple[list[dict], list[dict], int, str | None]:
     """Formulaires et réponses Forminator, via les routes du snippet (wpmcp/v1)."""

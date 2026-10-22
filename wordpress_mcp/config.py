@@ -27,6 +27,8 @@ Variables :
   WP_UPLOAD_ROOTS    dossiers d'où un fichier peut être envoyé à la médiathèque, séparés par
                      « : » (défaut ~/Documents:~/Downloads:~/Desktop)
   WP_UPLOAD_MAX_MB   taille maximale d'un fichier envoyé (défaut 20)
+  WP_SNIPPETS_DIR    dossier des snippets WPCode relus (wpcode-snippet-*.php) que le connecteur peut
+                     installer sur le site (défaut : dossier docs/ du connecteur)
 """
 from __future__ import annotations
 
@@ -52,6 +54,7 @@ class Settings:
     upload_roots: tuple[str, ...] = tuple(
         p for p in (os.environ.get("WP_UPLOAD_ROOTS") or "~/Documents:~/Downloads:~/Desktop").split(":") if p.strip())
     upload_max_mb: float = float(os.environ.get("WP_UPLOAD_MAX_MB", "20"))
+    snippets_dir: str = os.environ.get("WP_SNIPPETS_DIR") or str(Path(__file__).resolve().parent.parent / "docs")
 
     @property
     def authenticated(self) -> bool:

@@ -41,7 +41,9 @@ def _writes():
                                          ("POST", "/wp/v2/media/9"), ("POST", "/redirection/v1/redirect"),
                                          ("POST", "/redirection/v1/bulk/redirect/disable"),
                                          ("DELETE", "/elementor/v1/cache"), ("POST", "/wp/v2/menu-items/765"),
-                                         ("POST", "/wp/v2/menu-items"), ("POST", "/wp/v2/pages")])
+                                         ("POST", "/wp/v2/menu-items"), ("POST", "/wp/v2/pages"),
+                                         ("POST", "/wpmcp/v1/snippets"), ("POST", "/wpmcp/v1/snippets/12"),
+                                         ("POST", "/wpmcp/v1/snippets/12/statut")])
 def test_allowed_writes(method, path):
     check_write_allowed(method, path)
 
@@ -53,7 +55,8 @@ def test_allowed_writes(method, path):
                                          ("POST", "/wp/v2/pages/644/revisions"), ("POST", "/wp/v2/posts/12/../../users"),
                                          ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x"),
                                          ("DELETE", "/wp/v2/menu-items/765"), ("POST", "/wp/v2/menu-items/765/../1"),
-                                         ("POST", "/wp/v2/menus/5")])
+                                         ("POST", "/wp/v2/menus/5"), ("DELETE", "/wpmcp/v1/snippets/12"),
+                                         ("POST", "/wpmcp/v1/snippets/12/../../x"), ("POST", "/wpmcp/v1/snippets/a")])
 def test_refused_writes(method, path):
     with pytest.raises(WordPressError) as e:
         check_write_allowed(method, path)
@@ -676,3 +679,164 @@ async def test_page_create_draft(writes_on):
     with pytest.raises(WordPressError) as e:
         await WT.wp_ecriture_confirmer(prep["jeton"])
     assert e.value.code == "deja_present" and post.call_count == 1
+
+
+# ------------------------------------------------------------------ changement d'adresse (slug)
+@respx.mock
+async def test_page_slug_change_warns_and_checks_conflicts(writes_on):
+    page728 = {"id": 728, "status": "publish", "slug": "logec", "link": f"{BASE}/logec",
+               "modified": "2026-09-07T21:12:05", "title": {"raw": "L’OGEC"}}
+    respx.get(f"{BASE}/wp-json/wp/v2/pages/728").mock(side_effect=lambda r: httpx.Response(200, json=page728))
+
+    def by_slug(request):
+        s = request.url.params.get("slug")
+        return httpx.Response(200, json=[{"id": 30, "title": {"raw": "Contact"}}] if s == "contact" else [])
+    respx.get(f"{BASE}/wp-json/wp/v2/pages").mock(side_effect=by_slug)
+    post = respx.post(f"{BASE}/wp-json/wp/v2/pages/728").mock(
+        side_effect=lambda r: httpx.Response(200, json={**page728, **json.loads(r.content), "link": f"{BASE}/ogec"}))
+    prep = await WT.wp_page_preparer(728, slug="ogec")
+    assert prep["apercu"]["changements"]["adresse"] == {"avant": f"{BASE}/logec", "apres": f"{BASE}/ogec"}
+    assert any("wp_redirection_preparer(source='/logec', cible='/ogec')" in w for w in prep["avertissements"])
+    await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert json.loads(post.calls.last.request.content) == {"slug": "ogec"}
+    for kw, code in [({"slug": "contact"}, "deja_present"), ({"slug": "Mauvais Slug"}, "parametre"),
+                     ({"slug": "logec"}, "aucun_changement"), ({}, "parametre")]:
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_page_preparer(728, **kw)
+        assert e.value.code == code, kw
+
+
+# ------------------------------------------------------------------ snippets WPCode
+import hashlib
+
+
+def _h(code):
+    return hashlib.sha256(code.encode()).hexdigest()
+
+
+class FakeSnippets:
+    """Routes wpmcp/v1/snippets simulées (comportement du snippet docs/wpcode-snippet-gestion.php)."""
+
+    def __init__(self):
+        self.items = {5: {"id": 5, "titre": "MCP Gestion des snippets", "actif": True, "code": "// gestion\n"},
+                      7: {"id": 7, "titre": "MCP Auth", "actif": True, "code": "// auth\n"},
+                      9: {"id": 9, "titre": "Forminator lecture", "actif": False, "code": "// form\n"}}
+        self.next = 20
+        respx.get(url__regex=rf"{BASE}/wp-json/wpmcp/v1/snippets(/\d+)?$").mock(side_effect=self.get)
+        self.post = respx.post(url__regex=rf"{BASE}/wp-json/wpmcp/v1/snippets(/\d+)?(/statut)?$").mock(
+            side_effect=self.write)
+
+    def view(self, it, code=False):
+        v = {"id": it["id"], "titre": it["titre"], "actif": it["actif"], "type": "php", "emplacement": "everywhere",
+             "modifie": "2026-10-22 10:00:00", "sha256": _h(it["code"]), "taille": len(it["code"]),
+             "protege": it["titre"] in ("MCP Gestion des snippets", "MCP Auth"), "erreur": False}
+        if code:
+            v["code"] = it["code"]
+        return v
+
+    def get(self, request):
+        parts = request.url.path.rstrip("/").split("/")
+        if parts[-1].isdigit():
+            return httpx.Response(200, json=self.view(self.items[int(parts[-1])], code=True))
+        return httpx.Response(200, json=[self.view(i) for i in self.items.values()])
+
+    def write(self, request):
+        body = json.loads(request.content)
+        parts = request.url.path.rstrip("/").split("/")
+        if parts[-1] == "statut":
+            it = self.items[int(parts[-2])]
+            it["actif"] = bool(body["actif"])
+            return httpx.Response(200, json=self.view(it))
+        if parts[-1].isdigit():
+            it = self.items[int(parts[-1])]
+            assert body["sha256_actuel"] == _h(it["code"]) and body["sha256"] == _h(body["code"])
+            it["code"] = body["code"]
+            return httpx.Response(200, json={**self.view(it), "integre": True})
+        assert body["titre"].startswith("MCP ") and body["sha256"] == _h(body["code"])
+        it = {"id": self.next, "titre": body["titre"], "actif": False, "code": body["code"]}
+        self.items[self.next] = it
+        self.next += 1
+        return httpx.Response(200, json={**self.view(it), "integre": True})
+
+
+@pytest.fixture
+def snippets_dir(writes_on, tmp_path, monkeypatch):
+    d = tmp_path / "docs"
+    d.mkdir()
+    import dataclasses
+    monkeypatch.setattr(writes_on, "settings", dataclasses.replace(writes_on.settings, snippets_dir=str(d)))
+    return d
+
+
+@respx.mock
+async def test_snippet_install_create_then_update_then_activate(snippets_dir):
+    fake = FakeSnippets()
+    f = snippets_dir / "wpcode-snippet-securite.php"
+    f.write_text("<?php\n/** Sécurité */\nadd_action('init', function () { $r = '\\d+'; });\n", encoding="utf-8")
+    code = "/** Sécurité */\nadd_action('init', function () { $r = '\\d+'; });\n"
+    prep = await WT.wp_snippet_installer_preparer("wpcode-snippet-securite.php", "MCP Sécurité")
+    assert prep["apercu"]["code_complet"] == code and prep["apercu"]["operation"].startswith("création")
+    assert any("INACTIF" in w for w in prep["avertissements"]) and not _writes()
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert out["snippet"]["id"] == 20 and fake.items[20]["code"] == code and not fake.items[20]["actif"]
+    # même fichier, même code : rien à faire
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_snippet_installer_preparer("wpcode-snippet-securite.php", "MCP Sécurité")
+    assert e.value.code == "deja_a_jour"
+    # activation
+    prep = await WT.wp_snippet_activer_preparer(20, True)
+    assert prep["apercu"]["code_complet"] == code
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert fake.items[20]["actif"] and out["statut"] == "activé"
+    # mise à jour d'un snippet actif : différences + sauvegarde
+    f.write_text("<?php\n/** Sécurité v2 */\nadd_action('init', function () { $r = '\\d+'; });\n", encoding="utf-8")
+    prep = await WT.wp_snippet_installer_preparer("wpcode-snippet-securite.php", "MCP Sécurité")
+    assert "-/** Sécurité */" in prep["apercu"]["differences"] and "+/** Sécurité v2 */" in prep["apercu"]["differences"]
+    assert prep["avertissements"][0].startswith("Snippet ACTIF")
+    out = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert "v2" in fake.items[20]["code"] and out["sauvegarde"].startswith("snippet-20-")
+    # fichier modifié entre l'aperçu et la confirmation
+    f.write_text("<?php\n// v3\n", encoding="utf-8")
+    prep = await WT.wp_snippet_installer_preparer("wpcode-snippet-securite.php", "MCP Sécurité")
+    f.write_text("<?php\n// v4 non relue\n", encoding="utf-8")
+    n = fake.post.call_count
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and fake.post.call_count == n
+
+
+@respx.mock
+async def test_snippet_refusals(snippets_dir):
+    fake = FakeSnippets()
+    (snippets_dir / "wpcode-snippet-x.php").write_text("<?php\n// x\n", encoding="utf-8")
+    cases = [(("../secret.php", "MCP X"), "parametre"), (("/etc/passwd", "MCP X"), "parametre"),
+             (("wpcode-snippet-absent.php", "MCP X"), "introuvable"), (("wpcode-snippet-x.php", "Sécurité"), "parametre"),
+             (("wpcode-snippet-x.php", "MCP Auth"), "snippet_protege")]
+    for args, code in cases:
+        with pytest.raises(WordPressError) as e:
+            await WT.wp_snippet_installer_preparer(*args)
+        assert e.value.code == code, args
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_snippet_activer_preparer(5, False)
+    assert e.value.code == "snippet_protege"
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_snippet_activer_preparer(7, True)
+    assert e.value.code == "deja_a_jour"
+    # un snippet non « MCP » peut être activé (ex. lecture Forminator), avec aperçu du code
+    prep = await WT.wp_snippet_activer_preparer(9, True)
+    fake.items[9]["code"] = "// changé\n"
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and not _writes()
+
+
+@respx.mock
+async def test_snippets_missing_routes(snippets_dir):
+    (snippets_dir / "wpcode-snippet-x.php").write_text("<?php\n// x\n", encoding="utf-8")
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/snippets").mock(return_value=httpx.Response(
+        404, json={"code": "rest_no_route", "message": "Aucune route", "data": {"status": 404}}))
+    out = await S.wp_snippets()
+    assert out["snippets"] == [] and "wpcode-snippet-gestion.php" in out["note"]
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_snippet_installer_preparer("wpcode-snippet-x.php", "MCP X")
+    assert e.value.code == "snippets_indisponibles"
