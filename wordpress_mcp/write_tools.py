@@ -4,7 +4,7 @@ Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_prepar
 wp_page_creer_preparer, wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
 wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer, wp_extraits_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_snippet_installer_preparer,
-wp_snippet_activer_preparer, wp_ecriture_confirmer,
+wp_snippet_activer_preparer, wp_tableau_cellules_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
 
 Chaque *_preparer ne fait que des lectures ; l'écriture n'a lieu que dans un exécuteur
@@ -27,7 +27,7 @@ from urllib.parse import quote, urlsplit
 
 from . import elementor as E
 from .client import WordPressClient, WordPressError
-from .server import _get_client, _raw, _rendered, mcp
+from .server import _get_client, _raw, _rendered, mcp, tablepress_get
 from .writes import ConfirmationError, PendingWrite, WriteGate, WritesDisabledError, fingerprint
 
 _gate: WriteGate | None = None
@@ -1413,6 +1413,84 @@ async def _exec_snippet_activer(client: WordPressClient, gate: WriteGate, p: Pen
             "a_faire": "vider le cache WP Super Cache puis vérifier le site" if want else None}
 
 
+# ------------------------------------------------------------------ tableaux TablePress
+TABLE_CELLS_MAX = 200
+
+
+@mcp.tool()
+async def wp_tableau_cellules_preparer(id: int, corrections: list[dict[str, Any]]) -> dict[str, Any]:
+    """PRÉPARE la correction de cellules existantes d'un tableau TablePress (voir wp_tableaux) ;
+    n'écrit rien. `corrections` : [{"ligne": 2, "colonne": 3, "remplacer": "5.50€", "nouveau": "5,50 €"}, …]
+    (numérotation à partir de 1). Avec `remplacer`, seul cet extrait de la cellule change (il doit y
+    figurer une seule fois, HTML compris) ; sans `remplacer`, `nouveau` remplace toute la cellule.
+    Ni ajout ni suppression de ligne, de colonne ou de tableau. Visible dès la confirmation sur les
+    pages qui affichent le tableau. Nécessite le snippet docs/wpcode-snippet-tablepress.php."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    if not corrections or len(corrections) > TABLE_CELLS_MAX:
+        raise WordPressError(f"de 1 à {TABLE_CELLS_MAX} corrections", code="parametre")
+    table = await tablepress_get(client, f"/{int(id)}")
+    cells = [list(r) for r in table.get("cellules") or []]
+    new_cells = copy.deepcopy(cells)
+    rows, seen = [], set()
+    for c in corrections:
+        try:
+            li, co = int(c.get("ligne")), int(c.get("colonne"))
+        except (TypeError, ValueError) as e:
+            raise WordPressError("ligne et colonne : nombres entiers (à partir de 1)", code="parametre") from e
+        if not (1 <= li <= len(cells)) or not (1 <= co <= len(cells[li - 1])):
+            raise WordPressError(f"cellule ligne {li}, colonne {co} inexistante (tableau de {len(cells)} lignes)",
+                                 code="parametre")
+        if "nouveau" not in c or not isinstance(c.get("nouveau"), str):
+            raise WordPressError(f"ligne {li}, colonne {co} : « nouveau » (texte) manquant", code="parametre")
+        cur = new_cells[li - 1][co - 1]
+        old = c.get("remplacer")
+        if old is not None:
+            n = cur.count(old) if old else 0
+            if n != 1:
+                raise WordPressError(f"ligne {li}, colonne {co} : « {old} » trouvé {n} fois dans la cellule "
+                                     f"« {_short(cur, 200)} » (une seule fois attendu)", code="extrait_introuvable")
+            value = cur.replace(old, c["nouveau"])
+        else:
+            value = c["nouveau"]
+        if re.search(r"<\s*(script|iframe|style|object|embed)\b|<[^>]*\son\w+\s*=", value, re.I):
+            raise WordPressError(f"ligne {li}, colonne {co} : script ou attribut d'événement refusé", code="parametre")
+        if value == cur:
+            continue
+        seen.add((li, co))
+        new_cells[li - 1][co - 1] = value
+    changes = [{"ligne": li, "colonne": co, "valeur": new_cells[li - 1][co - 1]} for li, co in sorted(seen)]
+    for li, co in sorted(seen):
+        rows.append({"ligne": li, "colonne": co, "avant": cells[li - 1][co - 1], "apres": new_cells[li - 1][co - 1]})
+    if not changes:
+        raise WordPressError("aucun changement", code="aucun_changement")
+    return gate.prepare(
+        "tableau_cellules", {"id": int(id), "cellules": changes, "attendu": new_cells},
+        summary=f"Corriger {len(changes)} cellule(s) du tableau TablePress {id} « {table.get('nom', '')} »",
+        preview={"tableau": {"id": table.get("id"), "nom": table.get("nom")}, "cellules": rows},
+        guard={"sha256": table.get("sha256")},
+        warnings=["Visible dès la confirmation sur les pages qui affichent ce tableau (TablePress vide aussi le "
+                  "cache des pages). L'ancien contenu du tableau est sauvegardé localement."])
+
+
+async def _exec_tableau_cellules(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    tid = p.args["id"]
+    table = await tablepress_get(client, f"/{tid}")
+    if table.get("sha256") != p.guard.get("sha256"):
+        raise _stale_error(f"Le tableau {tid}")
+    backup = gate.save_backup("tableau", tid, {"id": tid, "nom": table.get("nom"), "cellules": table.get("cellules"),
+                                                "sha256": table.get("sha256")})
+    data = await client.write("POST", f"/wpmcp/v1/tablepress/tables/{tid}/cellules",
+                              json={"sha256_actuel": p.guard["sha256"], "cellules": p.args["cellules"]})
+    if data.get("cellules") != p.args["attendu"]:
+        raise WordPressError(f"tableau {tid} relu différent de l'attendu : le vérifier (sauvegarde {backup})",
+                             code="verification_echouee")
+    gate.journal("tableau_cellules", True, id=tid, cellules=len(p.args["cellules"]))
+    return {"tableau": tid, "cellules_corrigees": len(p.args["cellules"]), "sauvegarde": backup,
+            "a_faire": "vérifier la page qui affiche le tableau (TablePress vide le cache de page)"}
+
+
 EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaitable[dict[str, Any]]]] = {
     "article": _exec_article,
     "widget_texte": _exec_widget_texte,
@@ -1430,6 +1508,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "snippet_installer": _exec_snippet_installer,
     "snippet_activer": _exec_snippet_activer,
     "extraits": _exec_extraits,
+    "tableau_cellules": _exec_tableau_cellules,
 }
 
 

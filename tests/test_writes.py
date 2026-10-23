@@ -43,7 +43,8 @@ def _writes():
                                          ("DELETE", "/elementor/v1/cache"), ("POST", "/wp/v2/menu-items/765"),
                                          ("POST", "/wp/v2/menu-items"), ("POST", "/wp/v2/pages"),
                                          ("POST", "/wpmcp/v1/snippets"), ("POST", "/wpmcp/v1/snippets/12"),
-                                         ("POST", "/wpmcp/v1/snippets/12/statut")])
+                                         ("POST", "/wpmcp/v1/snippets/12/statut"),
+                                         ("POST", "/wpmcp/v1/tablepress/tables/6/cellules")])
 def test_allowed_writes(method, path):
     check_write_allowed(method, path)
 
@@ -56,7 +57,10 @@ def test_allowed_writes(method, path):
                                          ("POST", "/ai1wm/v1/import"), ("POST", "/wpmcp/v1/x"),
                                          ("DELETE", "/wp/v2/menu-items/765"), ("POST", "/wp/v2/menu-items/765/../1"),
                                          ("POST", "/wp/v2/menus/5"), ("DELETE", "/wpmcp/v1/snippets/12"),
-                                         ("POST", "/wpmcp/v1/snippets/12/../../x"), ("POST", "/wpmcp/v1/snippets/a")])
+                                         ("POST", "/wpmcp/v1/snippets/12/../../x"), ("POST", "/wpmcp/v1/snippets/a"),
+                                         ("POST", "/wpmcp/v1/tablepress/tables/6"),
+                                         ("DELETE", "/wpmcp/v1/tablepress/tables/6/cellules"),
+                                         ("POST", "/wpmcp/v1/tablepress/tables/a/cellules")])
 def test_refused_writes(method, path):
     with pytest.raises(WordPressError) as e:
         check_write_allowed(method, path)
@@ -878,3 +882,87 @@ async def test_extraits_batch(writes_on):
     with pytest.raises(WordPressError) as e:
         await WT.wp_ecriture_confirmer(prep["jeton"])
     assert post.call_count == n
+
+
+class FakeTablePress:
+    """Routes wpmcp/v1/tablepress simulées (comportement de docs/wpcode-snippet-tablepress.php)."""
+
+    def __init__(self):
+        self.cells = [["GARDERIE/ETUDE – Tarif", ""], ["Matin<br>7h 30", "215€"], ["Présence : 5.50€", "9€"]]
+        self.saved = None
+        respx.get(url__regex=rf"{BASE}/wp-json/wpmcp/v1/tablepress/tables(/\d+)?$").mock(side_effect=self.get)
+        self.post = respx.post(url__regex=rf"{BASE}/wp-json/wpmcp/v1/tablepress/tables/\d+/cellules$").mock(
+            side_effect=self.write)
+
+    def sha(self):
+        return _h(json.dumps(self.cells))
+
+    def get(self, request):
+        if request.url.path.rstrip("/").split("/")[-1] == "tables":
+            return httpx.Response(200, json=[{"id": "6", "nom": "Garderie", "lignes": 3, "colonnes": 2}])
+        if not request.url.path.endswith("/6"):
+            return httpx.Response(404, json={"code": "tableau_introuvable", "message": "introuvable"})
+        return httpx.Response(200, json={"id": "6", "nom": "Garderie", "cellules": self.cells, "sha256": self.sha()})
+
+    def write(self, request):
+        body = json.loads(request.content)
+        if body["sha256_actuel"] != self.sha():
+            return httpx.Response(409, json={"code": "modifie_entre_temps", "message": "changé"})
+        for c in body["cellules"]:
+            self.cells[c["ligne"] - 1][c["colonne"] - 1] = c["valeur"]
+        self.saved = body
+        return httpx.Response(200, json={"id": "6", "cellules": self.cells, "sha256": self.sha(), "integre": True})
+
+
+@respx.mock
+async def test_tableaux_read_and_hint_when_snippet_missing(writes_on):
+    FakeTablePress()
+    out = await S.wp_tableaux()
+    assert out["nombre"] == 1
+    t = await S.wp_tableaux(6)
+    assert t["lignes_numerotees"][1] == {"ligne": 2, "cellules": {"1": "Matin<br>7h 30", "2": "215€"}}
+    assert t["lignes_numerotees"][0]["cellules"] == {"1": "GARDERIE/ETUDE – Tarif"}  # cellules vides omises
+
+
+@respx.mock
+async def test_tableaux_snippet_missing_note(writes_on):
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/tablepress/tables").mock(
+        return_value=httpx.Response(404, json={"code": "rest_no_route", "message": "x"}))
+    out = await S.wp_tableaux()
+    assert "wpcode-snippet-tablepress.php" in out["note"]
+
+
+@respx.mock
+async def test_tableau_cellules_prepare_confirm(writes_on):
+    fake = FakeTablePress()
+    prep = await WT.wp_tableau_cellules_preparer(6, [
+        {"ligne": 1, "colonne": 1, "remplacer": "ETUDE", "nouveau": "ÉTUDE"},
+        {"ligne": 3, "colonne": 1, "remplacer": "5.50€", "nouveau": "5,50 €"},
+        {"ligne": 2, "colonne": 2, "nouveau": "215 €"},
+    ])
+    assert not fake.post.called
+    assert [(c["ligne"], c["colonne"]) for c in prep["apercu"]["cellules"]] == [(1, 1), (2, 2), (3, 1)]
+    assert prep["apercu"]["cellules"][2]["apres"] == "Présence : 5,50 €"
+    res = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert res["cellules_corrigees"] == 3 and res["sauvegarde"].startswith("tableau-6-")
+    assert fake.cells[0][0] == "GARDERIE/ÉTUDE – Tarif" and fake.cells[1][0] == "Matin<br>7h 30"
+
+
+@respx.mock
+async def test_tableau_cellules_refusals(writes_on):
+    fake = FakeTablePress()
+    with pytest.raises(WordPressError) as e:  # extrait absent
+        await WT.wp_tableau_cellules_preparer(6, [{"ligne": 2, "colonne": 2, "remplacer": "999", "nouveau": "x"}])
+    assert e.value.code == "extrait_introuvable"
+    with pytest.raises(WordPressError):  # cellule inexistante
+        await WT.wp_tableau_cellules_preparer(6, [{"ligne": 9, "colonne": 1, "nouveau": "x"}])
+    with pytest.raises(WordPressError):  # script refusé
+        await WT.wp_tableau_cellules_preparer(6, [{"ligne": 2, "colonne": 2, "nouveau": "<script>x</script>"}])
+    with pytest.raises(WordPressError) as e:  # aucun changement
+        await WT.wp_tableau_cellules_preparer(6, [{"ligne": 2, "colonne": 2, "remplacer": "215€", "nouveau": "215€"}])
+    assert e.value.code == "aucun_changement"
+    prep = await WT.wp_tableau_cellules_preparer(6, [{"ligne": 2, "colonne": 2, "nouveau": "215 €"}])
+    fake.cells[2][1] = "10€"  # modifié entre l'aperçu et la confirmation
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert e.value.code == "modifie_entre_temps" and not fake.post.called

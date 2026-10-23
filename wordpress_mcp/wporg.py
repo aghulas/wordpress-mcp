@@ -19,7 +19,7 @@ WPORG = "https://api.wordpress.org"
 CORE_PATH = "/core/version-check/1.7/"
 PLUGIN_PATH = "/plugins/info/1.2/"
 THEME_PATH = "/themes/info/1.2/"
-USER_AGENT = "wordpress-mcp/0.9"
+USER_AGENT = "wordpress-mcp/0.10"
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,99}$")
 _FEED_VERSION_RE = re.compile(r"<generator>\s*https?://wordpress\.org/\?v=([0-9][0-9.]*)\s*</generator>")
 

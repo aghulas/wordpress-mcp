@@ -3,7 +3,8 @@
 Outils :
   wp_statut, wp_reglages, wp_arborescence, wp_pages_list, wp_articles_list, wp_contenu_lire,
   wp_revisions, wp_recherche, wp_medias_list, wp_menus, wp_categories, wp_evenements,
-  wp_formulaires_soumissions, wp_redirections, wp_extensions, wp_utilisateurs, wp_sante
+  wp_formulaires_soumissions, wp_redirections, wp_extensions, wp_utilisateurs, wp_sante,
+  wp_snippets, wp_tableaux
 
 Lecture : seule la méthode GET passe par `client.request` (voir client.py). Écritures (v2) :
 outils *_preparer + wp_ecriture_confirmer dans write_tools.py, désactivés sauf WP_ENABLE_WRITES=1.
@@ -465,6 +466,45 @@ async def wp_snippets() -> dict[str, Any]:
         raise
     return {"nombre": len(items or []), "actifs": sum(1 for i in items or [] if i.get("actif")),
             "snippets": items or []}
+
+
+TABLEPRESS_SNIPPET = "docs/wpcode-snippet-tablepress.php"
+TABLEPRESS_HINT = (f"tableaux TablePress non lisibles : installer {TABLEPRESS_SNIPPET} dans WPCode "
+                   "(titre « MCP Tableaux TablePress », avec wp_snippet_installer_preparer), puis l'activer")
+
+
+async def tablepress_get(client: WordPressClient, path: str = "") -> Any:
+    """Routes du snippet TablePress ; 404 / route absente → message d'installation."""
+    try:
+        return await client.get("/wpmcp/v1/tablepress/tables" + path)
+    except WordPressError as e:
+        if e.code == "rest_no_route" or (e.status == 404 and e.code != "tableau_introuvable"):
+            raise WordPressError(TABLEPRESS_HINT, code="tablepress_indisponible") from e
+        raise
+
+
+@mcp.tool()
+async def wp_tableaux(id: int | None = None) -> dict[str, Any]:
+    """Tableaux TablePress du site (shortcode [table id=N /] dans les pages). Sans `id` : liste
+    (id, nom, description, lignes, colonnes, date de modification). Avec `id` : cellules du tableau,
+    contenu brut (HTML éventuel compris), lignes et colonnes numérotées à partir de 1, empreinte
+    sha256. Nécessite le snippet docs/wpcode-snippet-tablepress.php côté site (TablePress gratuit n'a
+    pas d'API REST). Corriger des cellules : wp_tableau_cellules_preparer."""
+    client = _get_client()
+    try:
+        if id is None:
+            items = await tablepress_get(client)
+            return {"nombre": len(items or []), "tableaux": items or []}
+        t = await tablepress_get(client, f"/{int(id)}")
+    except WordPressError as e:
+        if e.code == "tablepress_indisponible":
+            return {"tableaux": [], "note": str(e)}
+        raise
+    rows = t.get("cellules") or []
+    t["lignes_numerotees"] = [{"ligne": i + 1, "cellules": {str(j + 1): c for j, c in enumerate(r) if c != ""}}
+                              for i, r in enumerate(rows)]
+    t.pop("cellules", None)
+    return t
 
 
 async def _forminator_submissions(client: WordPressClient, form_id: int | None, depuis: str | None,

@@ -48,7 +48,7 @@ ALLOWED_NAMESPACES: frozenset[str] = frozenset({
     "elementor-pro/v1",     # licence
     "mec/v1",               # Modern Events Calendar
     "redirection/v1",       # extension Redirection
-    "wpmcp/v1",             # routes de lecture ajoutées par les snippets de docs/ (réponses Forminator)
+    "wpmcp/v1",             # routes ajoutées par les snippets de docs/ (Forminator, snippets, TablePress)
 })
 
 READ_METHODS: frozenset[str] = frozenset({"GET", "HEAD"})
@@ -69,6 +69,7 @@ ALLOWED_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/wpmcp/v1/snippets$")),                        # créer un snippet « MCP … » (inactif)
     ("POST", re.compile(r"^/wpmcp/v1/snippets/\d+$")),                    # remplacer le code d'un snippet « MCP … »
     ("POST", re.compile(r"^/wpmcp/v1/snippets/\d+/statut$")),             # activer / désactiver un snippet
+    ("POST", re.compile(r"^/wpmcp/v1/tablepress/tables/\d+/cellules$")),  # corriger des cellules TablePress
 )
 
 
@@ -158,7 +159,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.9.1",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.10",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -315,7 +316,7 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.9.1"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.10"}) as http:
             try:
                 resp = await http.get(url)
             except (httpx.TimeoutException, httpx.TransportError) as exc:

@@ -53,7 +53,7 @@ Variables d'environnement :
 }
 ```
 
-## Outils de lecture (17)
+## Outils de lecture (19)
 
 | Outil | Rôle | Compte requis | Validé en réel |
 |---|---|---|---|
@@ -72,11 +72,12 @@ Variables d'environnement :
 | `wp_formulaires_soumissions` | réponses aux formulaires Forminator (avec le snippet `docs/wpcode-snippet-forminator.php`) et Elementor Pro | admin | ✔ (snippet à installer) |
 | `wp_redirections` | règles Redirection et journal des 404 | oui | ✔ |
 | `wp_snippets` | snippets WPCode : titre, actif, type, emplacement, empreinte SHA-256 du code, protégé, erreur (avec le snippet `docs/wpcode-snippet-gestion.php`) | admin | ✔ (snippet à installer) |
+| `wp_tableaux` | tableaux TablePress : liste, ou cellules d'un tableau (contenu brut, lignes et colonnes numérotées à partir de 1, empreinte SHA-256) (avec le snippet `docs/wpcode-snippet-tablepress.php`) | admin | ✔ (snippet à installer) |
 | `wp_extensions` | extensions installées, inactives, thème actif | admin | ✔ |
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
 
-## Outils d'écriture (16, avec `WP_ENABLE_WRITES=1`)
+## Outils d'écriture (20, avec `WP_ENABLE_WRITES=1`)
 
 | Outil | Rôle |
 |---|---|
@@ -96,13 +97,14 @@ Variables d'environnement :
 | `wp_redirection_activer_preparer` | activer ou désactiver des règles (jamais de suppression) |
 | `wp_snippet_installer_preparer` | installer un snippet WPCode PHP « MCP … » **depuis un fichier relu** du dossier `WP_SNIPPETS_DIR` (nom simple `wpcode-snippet-xxx.php`, vérifié par `php -l`) : création **inactive** avec le code complet dans l'aperçu, ou remplacement du code d'un snippet existant de même titre avec les différences complètes et sauvegarde de l'ancien code ; refusé si le fichier change entre l'aperçu et la confirmation. Jamais de code saisi dans la conversation |
 | `wp_snippet_activer_preparer` | activer (WPCode teste le code et refuse s'il est en erreur) ou désactiver un snippet ; « MCP Gestion des snippets » et « MCP Auth » ne peuvent pas être désactivés à distance |
+| `wp_tableau_cellules_preparer` | corriger des cellules existantes d'un tableau TablePress : `[{ligne, colonne, remplacer, nouveau}]` (seul l'extrait `remplacer` change, il doit figurer une seule fois) ou cellule entière ; ni ajout ni suppression de ligne, de colonne ou de tableau ; scripts refusés ; sauvegarde locale du tableau, empreinte vérifiée côté site, relecture. TablePress vide lui-même le cache des pages |
 | `wp_ecriture_confirmer` | exécuter une écriture préparée, après accord explicite de l'utilisateur |
 | `wp_ecriture_annuler` / `wp_ecritures_en_attente` | abandonner une écriture préparée / lister celles en attente |
 
 Verrous (`writes.py`, `client.py`) :
 1. `WP_ENABLE_WRITES=1` obligatoire, sinon même la préparation est refusée.
 2. Jeton aléatoire, à usage unique, valable 10 minutes ; l'écriture exécutée est exactement celle de l'aperçu.
-3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor, création, mise à jour et activation de snippets WPCode « MCP … » (routes `wpmcp/v1/snippets` du snippet de gestion). Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
+3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor, création, mise à jour et activation de snippets WPCode « MCP … » (routes `wpmcp/v1/snippets` du snippet de gestion), correction de cellules TablePress (`wpmcp/v1/tablepress/tables/<id>/cellules`). Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
 4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, statut, empreinte du contenu, de l'entrée de menu, des textes d'une image ou du fichier), l'écriture est refusée.
 5. Les erreurs du connecteur héritent de `ToolError` : leur message (extrait introuvable, jeton expiré, page modifiée entre-temps…) est transmis au modèle au lieu d'un « Error executing tool » muet.
 6. Avant toute modification d'un contenu Elementor : sauvegarde JSON dans `WP_BACKUP_DIR` ; après : relecture et comparaison. Journal `journal.jsonl` (date, opération, identifiants, issue — jamais le contenu).
@@ -125,6 +127,7 @@ Sans identifiants (`WP_USER` absent), le serveur fonctionne en anonyme : contenu
 - **Événements MEC** : MEC Lite range les dates dans sa propre table, hors de l'API REST ; `wp_evenements` les lit dans le JSON-LD (`schema.org/Event`) de chaque page publique d'événement.
 - **Formulaires** : le site utilise **Forminator**, qui n'expose pas ses réponses en REST. Le snippet `docs/wpcode-snippet-forminator.php` (WPCode, à côté de celui d'authentification) ajoute deux routes en lecture seule, réservées aux administrateurs (`wpmcp/v1/forminator/forms` et `…/forms/<id>/entries`), qui passent par l'API PHP de Forminator et ne renvoient pas l'adresse IP. Sans lui, `wp_formulaires_soumissions` le signale dans `notes`. Les formulaires Elementor Pro, s'il y en a, sont lus en plus.
 - **Snippets WPCode** : WPCode n'a pas d'API REST. Le snippet `docs/wpcode-snippet-gestion.php` (à installer une fois à la main, titre « MCP Gestion des snippets », « Exécuter partout ») ajoute les routes `wpmcp/v1/snippets` réservées aux administrateurs ayant `unfiltered_html` : lecture, création de snippets PHP « MCP … » toujours inactifs, remplacement du code (empreinte SHA-256 vérifiée, refus si le code a changé depuis la lecture), activation/désactivation par l'API de WPCode (test du code avant activation). WPCode enregistre le code sans le protéger des antislashs : le snippet impose le code exact pendant l'enregistrement et renvoie `integre`. Aucune suppression ; désactiver ce snippet dans WPCode coupe l'accès.
+- **Tableaux TablePress** : la version gratuite n'a pas d'API REST. Le snippet `docs/wpcode-snippet-tablepress.php` (« MCP Tableaux TablePress ») ajoute `wpmcp/v1/tablepress/tables` (liste), `…/tables/<id>` (cellules + SHA-256) et `POST …/tables/<id>/cellules` (remplacement de cellules existantes, empreinte vérifiée, 200 au plus), réservés à `manage_options` + `unfiltered_html`, via `TablePress::$model_table` (load / save).
 - **Snippets facultatifs** (dans `docs/`, installables avec `wp_snippet_installer_preparer`, puis à activer) :
   - `wpcode-snippet-securite.php` : en-têtes de sécurité (HSTS, X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy), balises « generator » retirées, zoom mobile réactivé, auteurs et routes `/wp/v2/users` fermés aux visiteurs non connectés, index REST allégé, cookies de session sécurisés. Avec WP Super Cache en mode simple, cocher « Mettre en cache les en-têtes HTTP » pour que les en-têtes accompagnent les pages en cache.
   - `wpcode-snippet-performances.php` (visiteurs non connectés) : préchargement de la première image du diaporama d'en-tête du thème (`fetchpriority=high`) ; lien Google Fonts du thème remplacé par le fichier local d'Elementor quand il existe (doublon retiré) ; styles de Captcha by BestWebSoft et Dashicons non chargés sur les pages publiques ; hors des pages d'événement, blocs JSON-LD `Event` de Modern Events Calendar retirés (le mini-calendrier de la barre latérale en écrit un par jour d'événement, avec une description qui recopie le contenu de la page). Les pages d'événement les gardent : `wp_evenements` y lit les dates.

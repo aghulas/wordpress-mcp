@@ -1,6 +1,6 @@
 [project]
 name = "wordpress-mcp"
-version = "0.9.1"
+version = "0.10.0"
 description = "Serveur MCP (lecture, écriture avec confirmation) pour un site WordPress d'école — pages, articles, médias, menus, événements, formulaires, redirections, extensions"
 requires-python = ">=3.10"
 dependencies = [
