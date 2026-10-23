@@ -4,7 +4,7 @@ Outils : wp_article_preparer, wp_widget_texte_preparer, wp_page_restaurer_prepar
 wp_page_creer_preparer, wp_page_preparer, wp_page_regenerer_preparer, wp_page_modele_preparer, wp_menu_entree_preparer,
 wp_menu_entree_ajouter_preparer, wp_media_envoyer_preparer, wp_medias_alt_preparer, wp_extraits_preparer,
 wp_redirection_preparer, wp_redirection_activer_preparer, wp_snippet_installer_preparer,
-wp_snippet_activer_preparer, wp_tableau_cellules_preparer, wp_ecriture_confirmer,
+wp_snippet_activer_preparer, wp_tableau_cellules_preparer, wp_medias_supprimer_preparer, wp_ecriture_confirmer,
 wp_ecriture_annuler, wp_ecritures_en_attente.
 
 Chaque *_preparer ne fait que des lectures ; l'écriture n'a lieu que dans un exécuteur
@@ -450,6 +450,104 @@ async def _exec_media_envoyer(client: WordPressClient, gate: WriteGate, p: Pendi
     gate.journal("media_envoyer", True, id=media_id, fichier=info["nom"], sha256=info["sha256"][:16])
     return {"id": media_id, "url": data.get("source_url"), "page_du_media": data.get("link"),
             "avertissements": warnings}
+
+
+# ------------------------------------------------------------------ suppression de médias
+MEDIA_DELETE_MAX = 50
+FEATURED_TYPES = ("/wp/v2/posts", "/wp/v2/pages", "/wp/v2/mec-events")
+
+
+async def _featured_usage(client: WordPressClient, ids: set[int]) -> dict[int, list[str]]:
+    """Contenus (articles, pages, événements) dont l'image à la une est l'un des médias."""
+    used: dict[int, list[str]] = {}
+    for base in FEATURED_TYPES:
+        try:
+            items = await client.get_all(base, {"context": client.context, "status": "publish,draft,pending,private,future",
+                                               "_fields": "id,title,featured_media,type"}, 500)
+        except WordPressError:
+            continue  # type de contenu absent (extension désactivée) : rien à signaler
+        for it in items:
+            fm = int(it.get("featured_media") or 0)
+            if fm in ids:
+                used.setdefault(fm, []).append(f"{it.get('type')} {it.get('id')} « {html.unescape(_raw(it.get('title')))} »")
+    return used
+
+
+@mcp.tool()
+async def wp_medias_supprimer_preparer(ids: list[int], motif: str | None = None) -> dict[str, Any]:
+    """PRÉPARE la suppression DÉFINITIVE de 1 à 50 fichiers de la médiathèque (images, PDF…) ;
+    n'écrit rien. WordPress n'a pas de corbeille pour les médias : à la confirmation, chaque fichier
+    est d'abord copié sur ce poste (dossier des sauvegardes), puis supprimé avec ses miniatures.
+    Refusé si un fichier sert d'image à la une (la changer d'abord). `motif` : raison, pour le journal.
+    L'aperçu signale les contenus qui semblent encore citer le fichier."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+    try:
+        wanted = [int(i) for i in ids]
+    except (TypeError, ValueError) as e:
+        raise WordPressError("ids : liste d'identifiants entiers", code="parametre") from e
+    if not wanted or len(wanted) > MEDIA_DELETE_MAX or len(set(wanted)) != len(wanted):
+        raise WordPressError(f"de 1 à {MEDIA_DELETE_MAX} identifiants, sans doublon", code="parametre")
+    used = await _featured_usage(client, set(wanted))
+    rows, guard, warnings, plan = [], {}, [], []
+    for mid in wanted:
+        m = await client.get(f"/wp/v2/media/{mid}", {"context": "edit"})
+        if m.get("type") != "attachment" and m.get("media_type") is None:
+            raise WordPressError(f"{mid} n'est pas un média", code="parametre")
+        details = m.get("media_details") or {}
+        name = (details.get("file") or m.get("source_url") or "").rsplit("/", 1)[-1]
+        if mid in used:
+            raise WordPressError(f"média {mid} ({name}) : image à la une de " + " ; ".join(used[mid])
+                                 + " — la remplacer avant de supprimer", code="media_utilise")
+        cites = []
+        stem = Path(name).stem
+        if stem:
+            try:
+                hits = await client.get("/wp/v2/search", {"search": stem, "per_page": 10})
+                cites = [f"{h.get('subtype')} {h.get('id')} « {html.unescape(h.get('title') or '')} »" for h in hits or []]
+            except WordPressError:
+                pass
+        if cites:
+            warnings.append(f"média {mid} ({name}) : nom cité dans " + " ; ".join(cites) + " — vérifier avant de confirmer.")
+        rows.append({"id": mid, "titre": html.unescape(_raw(m.get("title"))), "fichier": name, "type_mime": m.get("mime_type"),
+                     "url": m.get("source_url"), "taille_ko": round((details.get("filesize") or 0) / 1024, 1),
+                     "alt": m.get("alt_text"), "rattache_a": m.get("post"), "date": m.get("date")})
+        guard[str(mid)] = fingerprint([m.get("modified"), m.get("source_url")])
+        plan.append({"id": mid, "url": m.get("source_url"), "nom": name})
+    warnings.insert(0, "Suppression DÉFINITIVE (pas de corbeille pour les médias). Une copie de chaque fichier est "
+                       "enregistrée sur ce poste avant la suppression ; les pages qui l'affichaient encore montreraient "
+                       "une image cassée.")
+    return gate.prepare("medias_supprimer", {"plan": plan, "motif": (motif or "").strip()[:200]},
+                        summary=f"Supprimer définitivement {len(plan)} média(s) de la médiathèque",
+                        preview={"medias": rows}, guard=guard, warnings=warnings)
+
+
+async def _exec_medias_supprimer(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    plan = p.args["plan"]
+    used = await _featured_usage(client, {s["id"] for s in plan})
+    if used:
+        raise WordPressError("image à la une entre-temps : " + " ; ".join(f"{k} → {v}" for k, v in used.items()),
+                             code="media_utilise")
+    for step in plan:
+        m = await client.get(f"/wp/v2/media/{step['id']}", {"context": "edit"})
+        if fingerprint([m.get("modified"), m.get("source_url")]) != p.guard.get(str(step["id"])):
+            raise _stale_error(f"Le média {step['id']}")
+    folder = gate.backup_dir() / "medias"
+    folder.mkdir(parents=True, exist_ok=True)
+    done, copies = [], []
+    for step in plan:
+        data = await client.download_public_file(step["url"])  # copie AVANT suppression ; échec = arrêt
+        local = folder / f"{step['id']}-{re.sub(r'[^A-Za-z0-9._-]', '_', step['nom'])}"
+        local.write_bytes(data)
+        copies.append(str(local))
+        res = await client.write("DELETE", f"/wp/v2/media/{step['id']}", params={"force": "true"})
+        if not (isinstance(res, dict) and res.get("deleted")):
+            raise WordPressError(f"média {step['id']} : WordPress n'a pas confirmé la suppression (copie : {local})",
+                                 code="verification_echouee")
+        done.append(step["id"])
+        gate.journal("medias_supprimer", True, id=step["id"], fichier=step["nom"], copie=str(local), motif=p.args.get("motif"))
+    return {"supprimes": done, "copies_locales": copies}
 
 
 # ======================================================================= redirections
@@ -1509,6 +1607,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "snippet_activer": _exec_snippet_activer,
     "extraits": _exec_extraits,
     "tableau_cellules": _exec_tableau_cellules,
+    "medias_supprimer": _exec_medias_supprimer,
 }
 
 

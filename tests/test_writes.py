@@ -44,12 +44,14 @@ def _writes():
                                          ("POST", "/wp/v2/menu-items"), ("POST", "/wp/v2/pages"),
                                          ("POST", "/wpmcp/v1/snippets"), ("POST", "/wpmcp/v1/snippets/12"),
                                          ("POST", "/wpmcp/v1/snippets/12/statut"),
-                                         ("POST", "/wpmcp/v1/tablepress/tables/6/cellules")])
+                                         ("POST", "/wpmcp/v1/tablepress/tables/6/cellules"),
+                                         ("DELETE", "/wp/v2/media/9")])
 def test_allowed_writes(method, path):
     check_write_allowed(method, path)
 
 
-@pytest.mark.parametrize("method,path", [("DELETE", "/wp/v2/posts/12"), ("DELETE", "/wp/v2/media/9"),
+@pytest.mark.parametrize("method,path", [("DELETE", "/wp/v2/posts/12"), ("DELETE", "/wp/v2/pages/9"),
+                                         ("DELETE", "/wp/v2/media"), ("DELETE", "/wp/v2/media/9/edit"),
                                          ("POST", "/wp/v2/users"), ("POST", "/wp/v2/plugins"),
                                          ("POST", "/wp/v2/settings"), ("PUT", "/wp/v2/pages/644"),
                                          ("POST", "/redirection/v1/bulk/redirect/delete"),
@@ -966,3 +968,95 @@ async def test_tableau_cellules_refusals(writes_on):
     with pytest.raises(WordPressError) as e:
         await WT.wp_ecriture_confirmer(prep["jeton"])
     assert e.value.code == "modifie_entre_temps" and not fake.post.called
+
+
+class FakeMediaDelete:
+    """Médiathèque simulée pour la suppression : médias 9 (libre) et 11 (image à la une de la page 10)."""
+
+    def __init__(self):
+        self.items = {9: {"id": 9, "type": "attachment", "media_type": "image", "mime_type": "image/png",
+                          "title": {"raw": "Illustration", "rendered": "Illustration"}, "alt_text": "x", "modified": "2026-10-23T10:00:00",
+                          "source_url": f"{BASE}/wp-content/uploads/2026/10/illu.png", "media_details": {"file": "2026/10/illu.png", "filesize": 2048},
+                          "post": None, "date": "2026-10-23T10:00:00"},
+                      11: {"id": 11, "type": "attachment", "media_type": "image", "mime_type": "image/jpeg",
+                           "title": {"raw": "Une", "rendered": "Une"}, "alt_text": "", "modified": "2026-10-23T10:00:00",
+                           "source_url": f"{BASE}/wp-content/uploads/2026/10/une.jpg", "media_details": {"file": "2026/10/une.jpg", "filesize": 10},
+                           "post": 10, "date": "2026-10-23T10:00:00"}}
+        self.deleted = []
+        self.file_ok = True
+        respx.get(url__regex=rf"{BASE}/wp-json/wp/v2/media/\d+(\?.*)?$").mock(side_effect=self.get)
+        respx.delete(url__regex=rf"{BASE}/wp-json/wp/v2/media/\d+(\?.*)?$").mock(side_effect=self.delete)
+        respx.get(url__regex=rf"{BASE}/wp-json/wp/v2/(posts|pages)(\?.*)?$").mock(side_effect=self.listing)
+        respx.get(url__regex=rf"{BASE}/wp-json/wp/v2/mec-events(\?.*)?$").mock(
+            return_value=httpx.Response(404, json={"code": "rest_no_route", "message": "x"}))
+        respx.get(url__regex=rf"{BASE}/wp-json/wp/v2/search(\?.*)?$").mock(side_effect=self.search)
+        respx.get(url__regex=rf"{BASE}/wp-content/uploads/.*").mock(side_effect=self.file)
+
+    def get(self, request):
+        mid = int(request.url.path.rstrip("/").split("/")[-1])
+        if mid not in self.items:
+            return httpx.Response(404, json={"code": "rest_post_invalid_id", "message": "introuvable"})
+        return httpx.Response(200, json=self.items[mid])
+
+    def listing(self, request):
+        if request.url.path.endswith("/pages"):
+            return httpx.Response(200, json=[{"id": 10, "type": "page", "title": {"rendered": "Accueil"}, "featured_media": 11}],
+                                  headers={"X-WP-TotalPages": "1"})
+        return httpx.Response(200, json=[], headers={"X-WP-TotalPages": "1"})
+
+    def search(self, request):
+        if "illu" in str(request.url):
+            return httpx.Response(200, json=[{"id": 12, "subtype": "post", "title": "Carnaval"}])
+        return httpx.Response(200, json=[])
+
+    def file(self, request):
+        return httpx.Response(200, content=b"PNGDATA") if self.file_ok else httpx.Response(500, text="boom")
+
+    def delete(self, request):
+        assert "force=true" in str(request.url)
+        mid = int(request.url.path.rstrip("/").split("/")[-1])
+        self.deleted.append(mid)
+        return httpx.Response(200, json={"deleted": True, "previous": self.items.pop(mid)})
+
+
+@respx.mock
+async def test_medias_supprimer_prepare_confirm_with_backup(writes_on):
+    fake = FakeMediaDelete()
+    prep = await WT.wp_medias_supprimer_preparer([9], motif="illustration remplacée")
+    assert prep["apercu"]["medias"][0]["fichier"] == "illu.png"
+    assert any("DÉFINITIVE" in w for w in prep["avertissements"])
+    assert any("Carnaval" in w for w in prep["avertissements"])  # nom cité dans un contenu : avertissement
+    assert fake.deleted == []
+    res = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert res["supprimes"] == [9] and fake.deleted == [9]
+    copie = res["copies_locales"][0]
+    assert copie.endswith("9-illu.png") and open(copie, "rb").read() == b"PNGDATA"
+
+
+@respx.mock
+async def test_medias_supprimer_refuses_featured_image(writes_on):
+    FakeMediaDelete()
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_medias_supprimer_preparer([11])
+    assert e.value.code == "media_utilise" and "Accueil" in str(e.value)
+
+
+@respx.mock
+async def test_medias_supprimer_aborts_if_backup_fails(writes_on):
+    fake = FakeMediaDelete()
+    prep = await WT.wp_medias_supprimer_preparer([9])
+    fake.file_ok = False
+    with pytest.raises(WordPressError):
+        await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert fake.deleted == []  # rien supprimé sans copie locale
+
+
+@respx.mock
+async def test_medias_supprimer_refusals(writes_on):
+    FakeMediaDelete()
+    with pytest.raises(WordPressError):
+        await WT.wp_medias_supprimer_preparer([])
+    with pytest.raises(WordPressError):
+        await WT.wp_medias_supprimer_preparer([9, 9])
+    with pytest.raises(WordPressError):
+        await WT.wp_medias_supprimer_preparer([999])

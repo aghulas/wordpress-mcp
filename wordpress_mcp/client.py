@@ -70,6 +70,7 @@ ALLOWED_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/wpmcp/v1/snippets/\d+$")),                    # remplacer le code d'un snippet « MCP … »
     ("POST", re.compile(r"^/wpmcp/v1/snippets/\d+/statut$")),             # activer / désactiver un snippet
     ("POST", re.compile(r"^/wpmcp/v1/tablepress/tables/\d+/cellules$")),  # corriger des cellules TablePress
+    ("DELETE", re.compile(r"^/wp/v2/media/\d+$")),                        # supprimer un média (copie locale avant)
 )
 
 
@@ -159,7 +160,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.10",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.11",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -307,6 +308,29 @@ class WordPressClient:
             page += 1
         return items[:limit]
 
+    def _check_same_site(self, url: str) -> None:
+        from urllib.parse import urlsplit
+        want = (urlsplit(self.settings.base_url or str(self._http.base_url)).hostname or "").removeprefix("www.")
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
+            raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
+
+    async def download_public_file(self, url: str, max_bytes: int = 64 * 1024 * 1024) -> bytes:
+        """Octets d'un fichier public du MÊME site (GET, sans identifiants) : copie de sauvegarde d'un média."""
+        self._check_same_site(url)
+        async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
+                                     headers={"User-Agent": "wordpress-mcp/0.11"}) as http:
+            try:
+                resp = await http.get(url)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                raise _network_error(exc, self.settings.timeout) from exc
+        if resp.status_code >= 400:
+            raise WordPressError(_http_error_message(resp.status_code, f"HTTP {resp.status_code}"),
+                                 status=resp.status_code)
+        if len(resp.content) > max_bytes:
+            raise WordPressError("fichier trop volumineux pour la copie de sauvegarde", code="trop_volumineux")
+        return resp.content
+
     async def get_public_page(self, url: str) -> str:
         """HTML d'une page publique du MÊME site (GET, sans identifiants). Sert aux données que l'API
         REST n'expose pas (dates MEC). Refuse tout autre domaine, tout schéma non https/http."""
@@ -316,7 +340,7 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.10"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.11"}) as http:
             try:
                 resp = await http.get(url)
             except (httpx.TimeoutException, httpx.TransportError) as exc:

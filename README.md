@@ -77,7 +77,7 @@ Variables d'environnement :
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
 
-## Outils d'écriture (20, avec `WP_ENABLE_WRITES=1`)
+## Outils d'écriture (21, avec `WP_ENABLE_WRITES=1`)
 
 | Outil | Rôle |
 |---|---|
@@ -98,13 +98,14 @@ Variables d'environnement :
 | `wp_snippet_installer_preparer` | installer un snippet WPCode PHP « MCP … » **depuis un fichier relu** du dossier `WP_SNIPPETS_DIR` (nom simple `wpcode-snippet-xxx.php`, vérifié par `php -l`) : création **inactive** avec le code complet dans l'aperçu, ou remplacement du code d'un snippet existant de même titre avec les différences complètes et sauvegarde de l'ancien code ; refusé si le fichier change entre l'aperçu et la confirmation. Jamais de code saisi dans la conversation |
 | `wp_snippet_activer_preparer` | activer (WPCode teste le code et refuse s'il est en erreur) ou désactiver un snippet ; « MCP Gestion des snippets » et « MCP Auth » ne peuvent pas être désactivés à distance |
 | `wp_tableau_cellules_preparer` | corriger des cellules existantes d'un tableau TablePress : `[{ligne, colonne, remplacer, nouveau}]` (seul l'extrait `remplacer` change, il doit figurer une seule fois) ou cellule entière ; ni ajout ni suppression de ligne, de colonne ou de tableau ; scripts refusés ; sauvegarde locale du tableau, empreinte vérifiée côté site, relecture. TablePress vide lui-même le cache des pages |
+| `wp_medias_supprimer_preparer` | supprimer **définitivement** de 1 à 50 fichiers de la médiathèque (WordPress n'a pas de corbeille pour les médias) : refusé si un fichier est l'image à la une d'un article, d'une page ou d'un événement ; l'aperçu signale les contenus qui citent encore le nom du fichier ; à la confirmation, chaque fichier est d'abord copié dans `WP_BACKUP_DIR/medias/`, puis supprimé avec ses miniatures (`DELETE …?force=true`) ; motif consigné dans le journal |
 | `wp_ecriture_confirmer` | exécuter une écriture préparée, après accord explicite de l'utilisateur |
 | `wp_ecriture_annuler` / `wp_ecritures_en_attente` | abandonner une écriture préparée / lister celles en attente |
 
 Verrous (`writes.py`, `client.py`) :
 1. `WP_ENABLE_WRITES=1` obligatoire, sinon même la préparation est refusée.
 2. Jeton aléatoire, à usage unique, valable 10 minutes ; l'écriture exécutée est exactement celle de l'aperçu.
-3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor, création, mise à jour et activation de snippets WPCode « MCP … » (routes `wpmcp/v1/snippets` du snippet de gestion), correction de cellules TablePress (`wpmcp/v1/tablepress/tables/<id>/cellules`). Aucun `DELETE` de contenu, aucune modification d'utilisateurs, d'extensions ni de réglages.
+3. Liste blanche `ALLOWED_WRITES` (méthode + chemin exact) : créer/modifier un article, créer une page en brouillon, contenu, mise en page, titre et statut d'une page ou d'un article existant, envoi d'un média et de ses textes, ajout et modification d'une entrée dans un menu existant (pas de création ni de suppression de menu, pas de suppression d'entrée), création et activation de redirections, vidage du cache Elementor, création, mise à jour et activation de snippets WPCode « MCP … » (routes `wpmcp/v1/snippets` du snippet de gestion), correction de cellules TablePress (`wpmcp/v1/tablepress/tables/<id>/cellules`), suppression d'un média (`DELETE /wp/v2/media/<id>`, seule suppression autorisée, avec copie locale préalable). Aucun autre `DELETE`, aucune modification d'utilisateurs, d'extensions ni de réglages.
 4. Contrôle de fraîcheur : à la confirmation l'élément est relu ; s'il a changé depuis l'aperçu (date de modification, statut, empreinte du contenu, de l'entrée de menu, des textes d'une image ou du fichier), l'écriture est refusée.
 5. Les erreurs du connecteur héritent de `ToolError` : leur message (extrait introuvable, jeton expiré, page modifiée entre-temps…) est transmis au modèle au lieu d'un « Error executing tool » muet.
 6. Avant toute modification d'un contenu Elementor : sauvegarde JSON dans `WP_BACKUP_DIR` ; après : relecture et comparaison. Journal `journal.jsonl` (date, opération, identifiants, issue — jamais le contenu).
