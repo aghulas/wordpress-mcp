@@ -126,6 +126,9 @@ Sans identifiants (`WP_USER` absent), le serveur fonctionne en anonyme : contenu
 ## Limites constatées sur le site de l'école (21/10/2026)
 
 - **Événements MEC** : MEC Lite range les dates dans sa propre table, hors de l'API REST ; `wp_evenements` les lit dans le JSON-LD (`schema.org/Event`) de chaque page publique d'événement.
+  - Écriture : pas d'outil du connecteur ; MEC Lite importe son flux XML (wp-admin › M.E. Calendar › Importer/Exporter › « Import MEC XML Feed »). Un `<item>` avec un `ID` de flux déjà connu (méta `mec_feed_event_id`) met à jour l'événement, y compris s'il est à la corbeille (il est republié) ; les catégories s'ajoutent.
+  - Image à la une : `<featured_image><full>URL</full></featured_image>` est posée si l'événement n'en a pas ; MEC réutilise le média dont le `guid` est cette URL. Envoyer d'abord l'image avec `wp_media_envoyer_preparer` (texte alternatif compris), puis importer avec son URL : aucun doublon. Pour la changer : événement à la corbeille, `wp_medias_supprimer_preparer` sur l'ancien média (WordPress retire aussi les `_thumbnail_id`), nouveau média sous le même nom, réimport du même `ID`.
+  - `outils/illustrations_agenda.py` produit des illustrations sans texte (1200×675, pictogramme Tabler centré sur fond de couleur, confettis), qui résistent aux recadrages de l'agenda.
 - **Formulaires** : le site utilise **Forminator**, qui n'expose pas ses réponses en REST. Le snippet `docs/wpcode-snippet-forminator.php` (WPCode, à côté de celui d'authentification) ajoute deux routes en lecture seule, réservées aux administrateurs (`wpmcp/v1/forminator/forms` et `…/forms/<id>/entries`), qui passent par l'API PHP de Forminator et ne renvoient pas l'adresse IP. Sans lui, `wp_formulaires_soumissions` le signale dans `notes`. Les formulaires Elementor Pro, s'il y en a, sont lus en plus.
 - **Snippets WPCode** : WPCode n'a pas d'API REST. Le snippet `docs/wpcode-snippet-gestion.php` (à installer une fois à la main, titre « MCP Gestion des snippets », « Exécuter partout ») ajoute les routes `wpmcp/v1/snippets` réservées aux administrateurs ayant `unfiltered_html` : lecture, création de snippets PHP « MCP … » toujours inactifs, remplacement du code (empreinte SHA-256 vérifiée, refus si le code a changé depuis la lecture), activation/désactivation par l'API de WPCode (test du code avant activation). WPCode enregistre le code sans le protéger des antislashs : le snippet impose le code exact pendant l'enregistrement et renvoie `integre`. Aucune suppression ; désactiver ce snippet dans WPCode coupe l'accès.
 - **Tableaux TablePress** : la version gratuite n'a pas d'API REST. Le snippet `docs/wpcode-snippet-tablepress.php` (« MCP Tableaux TablePress ») ajoute `wpmcp/v1/tablepress/tables` (liste), `…/tables/<id>` (cellules + SHA-256) et `POST …/tables/<id>/cellules` (remplacement de cellules existantes, empreinte vérifiée, 200 au plus), réservés à `manage_options` + `unfiltered_html`, via `TablePress::$model_table` (load / save).
@@ -156,6 +159,10 @@ Une page Elementor stocke sa mise en page dans la méta `_elementor_data` (JSON)
 ## Erreurs réseau
 
 Délai dépassé (`delai_depasse`), site injoignable (`site_injoignable`) et erreurs 5xx sont traduits en `WordPressError` avec un message explicite : sans cela, Claude Desktop n'affiche que « Error executing tool ». Quand l'hébergement mutualisé sature, une image statique répond elle aussi lentement : c'est le signe que le problème vient du serveur et non de WordPress.
+
+## Outils annexes
+
+- `outils/illustrations_agenda.py evenements.json sortie/` : illustrations PNG colorées pour l'agenda (voir l'en-tête du fichier ; pictogrammes `@tabler/icons` via npm, rendu par Playwright/Chromium).
 
 ## Développement
 
