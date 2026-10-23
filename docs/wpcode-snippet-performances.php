@@ -14,6 +14,11 @@
  * - Captcha by BestWebSoft : ses feuilles de style (et Dashicons qu'elles entraînent) ne sont plus
  *   chargées sur les pages publiques pour les visiteurs non connectés ; le captcha reste sur la
  *   page de connexion. Si une autre extension a besoin de Dashicons, WordPress le charge quand même.
+ * - Agenda (Modern Events Calendar) : hors des pages d'événement, retire les blocs de données
+ *   structurées JSON-LD « Event » que le petit calendrier de la barre latérale écrit pour chaque
+ *   jour d'événement du mois. Leur description recopie tout le contenu de la page affichée
+ *   (interaction MEC / Elementor) : un événement de plusieurs jours multipliait le poids de la
+ *   page. Les pages d'événement gardent leurs données structurées.
  *
  * Installation : WPCode › Ajouter un extrait › Extrait PHP ; coller ce fichier SANS la ligne
  * « <?php » ; Insertion « Exécuter partout » ; Activer. Pour tout annuler : désactiver le snippet.
@@ -78,13 +83,22 @@ add_action( 'wp_enqueue_scripts', function () {
 	wp_dequeue_style( 'dashicons' );
 }, 100 );
 
-// Image d'en-tête : préchargement de la première image du diaporama.
+// Image d'en-tête : préchargement de la première image du diaporama ; JSON-LD de l'agenda.
 add_action( 'template_redirect', function () {
 	if ( ! wpmcp_perf_front() || is_feed() ) {
 		return;
 	}
-	ob_start( function ( $html ) {
-		if ( ! is_string( $html ) || false === stripos( $html, '<head' ) || false !== stripos( $html, 'rel="preload" as="image"' ) ) {
+	$keep_events = is_singular( 'mec-events' );
+	ob_start( function ( $html ) use ( $keep_events ) {
+		if ( ! is_string( $html ) || false === stripos( $html, '<head' ) ) {
+			return $html;
+		}
+		if ( ! $keep_events ) {
+			$html = preg_replace_callback( '#<script type=["\']application/ld\+json["\']>(.*?)</script>\s*#is', function ( $m ) {
+				return preg_match( '#"@type"\s*:\s*"Event"#', $m[1] ) ? '' : $m[0];
+			}, $html );
+		}
+		if ( false !== stripos( $html, 'rel="preload" as="image"' ) ) {
 			return $html;
 		}
 		$pattern = '#class=["\'][^"\']*\bentry-header(?:-slider-item)?\b[^"\']*["\'][^>]*?style=["\'][^"\']*background-image\s*:\s*url\(\s*(?:&quot;|["\'])?([^"\')&]+)#i';

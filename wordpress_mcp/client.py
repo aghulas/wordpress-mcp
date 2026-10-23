@@ -82,6 +82,24 @@ class WordPressError(ToolError):
         self.status = status
 
 
+def _network_error(exc: httpx.HTTPError, timeout: float, write: bool = False) -> WordPressError:
+    """Délai dépassé ou site injoignable → message clair (sinon Claude Desktop n'affiche que
+    « Error executing tool »). Pour une écriture, l'issue est inconnue : le dire."""
+    suite = (" L'écriture a peut-être été appliquée malgré tout : vérifier l'état du site avant de "
+             "recommencer." if write else " Réessayer dans quelques minutes.")
+    if isinstance(exc, httpx.TimeoutException):
+        return WordPressError(
+            f"le site n'a pas répondu dans le délai ({timeout:g} s, réglage WP_TIMEOUT) : serveur "
+            f"surchargé ou lent.{suite}", code="delai_depasse")
+    return WordPressError(f"site injoignable ({type(exc).__name__}).{suite}", code="site_injoignable")
+
+
+def _http_error_message(status: int, message: str) -> str:
+    if status >= 500 and message == f"HTTP {status}":
+        message += " — erreur du serveur (hébergement surchargé ou extension en erreur) ; réessayer plus tard"
+    return message
+
+
 def _namespace_of(path: str) -> str:
     """Espace de noms REST d'un chemin `/wp/v2/pages` → `wp/v2` ; `/` → ``."""
     parts = [p for p in path.strip("/").split("/") if p]
@@ -140,7 +158,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.9",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.9.1",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -156,23 +174,32 @@ class WordPressClient:
         self._http.cookies.clear()
         self._nonce = None
         self._http.cookies.set("wordpress_test_cookie", "WP Cookie check", domain=self._http.base_url.host)
-        resp = await self._http.post(
-            LOGIN_PATH,
-            data={"log": st.user, "pwd": st.password, "wp-submit": "Log In",
-                  "redirect_to": f"{st.base_url}/wp-admin/", "testcookie": "1"},
-            follow_redirects=False,
-        )
+        try:
+            resp = await self._post_login(st)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _network_error(exc, st.timeout) from exc
         if not any(c.name.startswith("wordpress_logged_in") for c in self._http.cookies.jar):
             raise WordPressError(
                 "connexion refusée par wp-login.php : identifiant ou mot de passe incorrect, ou double "
                 "authentification / captcha / extension de sécurité qui bloque la connexion",
                 code="login_refuse", status=resp.status_code)
-        r = await self._http.get(NONCE_PATH, params={"action": "rest-nonce"})
+        try:
+            r = await self._http.get(NONCE_PATH, params={"action": "rest-nonce"})
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _network_error(exc, st.timeout) from exc
         nonce = r.text.strip()
         if r.status_code != 200 or not re.fullmatch(r"[A-Za-z0-9]{6,20}", nonce):
             raise WordPressError("connecté, mais le jeton REST (nonce) est introuvable "
                                  "(admin-ajax.php bloqué ?)", code="nonce_introuvable", status=r.status_code)
         self._nonce = nonce
+
+    async def _post_login(self, st: Settings) -> httpx.Response:
+        return await self._http.post(
+            LOGIN_PATH,
+            data={"log": st.user, "pwd": st.password, "wp-submit": "Log In",
+                  "redirect_to": f"{st.base_url}/wp-admin/", "testcookie": "1"},
+            follow_redirects=False,
+        )
 
     async def _ensure_login(self, stale: str | None = None) -> None:
         async with self._login_lock:
@@ -185,7 +212,10 @@ class WordPressClient:
             if self._nonce is None:
                 await self._ensure_login()
             headers = {"X-WP-Nonce": self._nonce or ""}
-        return await self._http.request(method, url, params=params, headers=headers)
+        try:
+            return await self._http.request(method, url, params=params, headers=headers)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _network_error(exc, self.settings.timeout) from exc
 
     @staticmethod
     def _session_expired(resp: httpx.Response) -> bool:
@@ -212,6 +242,7 @@ class WordPressClient:
                 message = body.get("message") or message
             except ValueError:
                 pass
+            message = _http_error_message(resp.status_code, message)
             if resp.status_code == 401:
                 message += (" — identifiants absents ou refusés (WP_USER / WP_PASSWORD)" if self._cookie_mode
                             else " — identifiants absents ou refusés (WP_USER / WP_APP_PASSWORD)")
@@ -232,8 +263,11 @@ class WordPressClient:
             if self._nonce is None:
                 await self._ensure_login()
             hdrs["X-WP-Nonce"] = self._nonce or ""
-        resp = await self._http.request(method.upper(), url, params=params, json=json, content=content,
-                                        headers=hdrs or None)
+        try:
+            resp = await self._http.request(method.upper(), url, params=params, json=json, content=content,
+                                            headers=hdrs or None)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise _network_error(exc, self.settings.timeout, write=True) from exc
         if resp.status_code >= 400:
             code, message = None, f"HTTP {resp.status_code}"
             try:
@@ -241,7 +275,8 @@ class WordPressClient:
                 code, message = body.get("code"), body.get("message") or message
             except ValueError:
                 pass
-            raise WordPressError(message, code=code, status=resp.status_code)
+            raise WordPressError(_http_error_message(resp.status_code, message), code=code,
+                                 status=resp.status_code)
         if not resp.content:
             return None
         try:
@@ -280,10 +315,14 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.9"}) as http:
-            resp = await http.get(url)
+                                     headers={"User-Agent": "wordpress-mcp/0.9.1"}) as http:
+            try:
+                resp = await http.get(url)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                raise _network_error(exc, self.settings.timeout) from exc
         if resp.status_code >= 400:
-            raise WordPressError(f"HTTP {resp.status_code}", status=resp.status_code)
+            raise WordPressError(_http_error_message(resp.status_code, f"HTTP {resp.status_code}"),
+                                 status=resp.status_code)
         return resp.text
 
     # ------------------------------------------------------------------ raccourcis

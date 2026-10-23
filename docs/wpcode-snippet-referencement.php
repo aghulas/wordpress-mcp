@@ -10,7 +10,10 @@
  *   « Search... » → « Rechercher… », « read more » → « lire la suite »), et nom et avatar de l'auteur masqués dans
  *   la page de résultats.
  * - Agenda (Modern Events Calendar, libellés non traduits) : « Expired! » → « Terminé »,
- *   « Ongoing... » → « En cours ».
+ *   « Ongoing... » → « En cours » ; traduction fautive « Vu en liste » → « Vue en liste ».
+ * - Page 404 et articles du thème en français (« Page not found! », « You May Also Like »…).
+ * - Affichage : sur mobile, les tableaux TablePress défilent horizontalement au lieu d'être
+ *   coupés ; dans les résultats de recherche, ni date de publication ni boutons de partage.
  *
  * Installation : WPCode › Ajouter un extrait › Extrait PHP ; coller ce fichier SANS la ligne
  * « <?php » ; Insertion « Exécuter partout » ; Activer. Pour tout annuler : désactiver le snippet.
@@ -51,9 +54,28 @@ add_filter( 'gettext', function ( $translation, $text ) {
 			return 'Terminé';
 		case 'Ongoing...': // Modern Events Calendar : événement en cours
 			return 'En cours';
+		case 'Page not found!':
+		case 'Page Not Found!':
+			return 'Page introuvable';
+		case 'Homepage':
+			return "la page d'accueil";
+		case 'You May Also Like':
+			return 'À lire aussi';
+	}
+	if ( 0 === strpos( $text, 'It seems we can' ) ) { // page 404 du thème
+		return 'La page demandée n\'existe pas ou a été déplacée. Utilisez la recherche ou revenez à ';
+	}
+	if ( 'Vu en liste' === $translation ) { // traduction fautive de MEC
+		return 'Vue en liste';
 	}
 	return $translation;
 }, 20, 2 );
+
+// Affichage : tableaux TablePress lisibles sur mobile ; résultats de recherche sans date ni partage.
+add_action( 'wp_head', function () {
+	echo '<style id="wpmcp-affichage">@media (max-width:767px){.tablepress{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}}'
+		. '.search .post-date,.search .post-meta .meta-sep,.search .post-share{display:none!important}</style>' . "\n";
+}, 99 );
 
 // Page de résultats : ni nom ni avatar d'auteur sous chaque résultat (pas d'appel à Gravatar).
 add_filter( 'get_avatar', function ( $avatar ) {

@@ -130,3 +130,41 @@ def test_missing_base_url_refused():
     with pytest.raises(WordPressError) as e:
         WordPressClient(dataclasses.replace(make_settings(), base_url=""))
     assert e.value.code == "config"
+
+
+@respx.mock
+async def test_timeout_gives_clear_error():
+    respx.get(f"{BASE}/wp-json/").mock(side_effect=httpx.ReadTimeout("lent"))
+    client = make_client()
+    with pytest.raises(WordPressError) as e:
+        await client.site_info()
+    assert e.value.code == "delai_depasse"
+    assert "WP_TIMEOUT" in str(e.value) and "Réessayer" in str(e.value)
+
+
+@respx.mock
+async def test_connect_error_gives_clear_error():
+    respx.get(f"{BASE}/wp-json/").mock(side_effect=httpx.ConnectError("refusé"))
+    client = make_client()
+    with pytest.raises(WordPressError) as e:
+        await client.site_info()
+    assert e.value.code == "site_injoignable"
+
+
+@respx.mock
+async def test_server_error_message_mentions_overload():
+    respx.get(f"{BASE}/wp-json/").mock(return_value=httpx.Response(500, text="<html>erreur</html>"))
+    client = make_client()
+    with pytest.raises(WordPressError) as e:
+        await client.site_info()
+    assert e.value.status == 500 and "surchargé" in str(e.value)
+
+
+@respx.mock
+async def test_write_timeout_warns_outcome_unknown():
+    respx.post(f"{BASE}/wp-json/wp/v2/pages/5").mock(side_effect=httpx.ReadTimeout("lent"))
+    client = make_client(enable_writes=True)
+    with pytest.raises(WordPressError) as e:
+        await client.write("POST", "/wp/v2/pages/5", json={"title": "x"})
+    assert e.value.code == "delai_depasse"
+    assert "peut-être été appliquée" in str(e.value)

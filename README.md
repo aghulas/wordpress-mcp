@@ -30,7 +30,7 @@ Variables d'environnement :
 | `WP_AUTH_HEADER` | (mode basic) en-tête de remplacement, ex. `X-Claude-Auth`, quand l'hébergeur retire `Authorization` — voir `docs/wpcode-snippet.php` |
 | `WP_APP_PASSWORD` | (mode basic) mot de passe d'application de cet utilisateur |
 | `WP_PASSWORD` | (mode cookie) mot de passe WordPress du compte |
-| `WP_TIMEOUT` | délai HTTP en secondes (défaut 30) |
+| `WP_TIMEOUT` | délai HTTP en secondes (défaut 30). Au-delà, l'outil répond « le site n'a pas répondu dans le délai » (code `delai_depasse`) ; pour une écriture, il précise qu'elle a peut-être été appliquée |
 | `WP_PER_PAGE_MAX` | plafond d'éléments renvoyés par un outil de liste (défaut 200) |
 | `WP_ENABLE_WRITES` | `1` pour autoriser les écritures avec confirmation (défaut : désactivées) |
 | `WP_WRITE_TTL` | validité d'un jeton de confirmation, en secondes (défaut 600) |
@@ -127,8 +127,8 @@ Sans identifiants (`WP_USER` absent), le serveur fonctionne en anonyme : contenu
 - **Snippets WPCode** : WPCode n'a pas d'API REST. Le snippet `docs/wpcode-snippet-gestion.php` (à installer une fois à la main, titre « MCP Gestion des snippets », « Exécuter partout ») ajoute les routes `wpmcp/v1/snippets` réservées aux administrateurs ayant `unfiltered_html` : lecture, création de snippets PHP « MCP … » toujours inactifs, remplacement du code (empreinte SHA-256 vérifiée, refus si le code a changé depuis la lecture), activation/désactivation par l'API de WPCode (test du code avant activation). WPCode enregistre le code sans le protéger des antislashs : le snippet impose le code exact pendant l'enregistrement et renvoie `integre`. Aucune suppression ; désactiver ce snippet dans WPCode coupe l'accès.
 - **Snippets facultatifs** (dans `docs/`, installables avec `wp_snippet_installer_preparer`, puis à activer) :
   - `wpcode-snippet-securite.php` : en-têtes de sécurité (HSTS, X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy), balises « generator » retirées, zoom mobile réactivé, auteurs et routes `/wp/v2/users` fermés aux visiteurs non connectés, index REST allégé, cookies de session sécurisés. Avec WP Super Cache en mode simple, cocher « Mettre en cache les en-têtes HTTP » pour que les en-têtes accompagnent les pages en cache.
-  - `wpcode-snippet-performances.php` (visiteurs non connectés) : préchargement de la première image du diaporama d'en-tête du thème (`fetchpriority=high`) ; lien Google Fonts du thème remplacé par le fichier local d'Elementor quand il existe (doublon retiré) ; styles de Captcha by BestWebSoft et Dashicons non chargés sur les pages publiques.
-  - `wpcode-snippet-referencement.php` : balise meta description à partir de l'extrait manuel (écrit avec `wp_extraits_preparer`), sauf si une extension SEO est active ; textes restés en anglais traduits par `gettext` (formulaire de recherche, « read more », libellés « Expired! » / « Ongoing... » de Modern Events Calendar) ; ni nom ni avatar d'auteur dans les résultats de recherche.
+  - `wpcode-snippet-performances.php` (visiteurs non connectés) : préchargement de la première image du diaporama d'en-tête du thème (`fetchpriority=high`) ; lien Google Fonts du thème remplacé par le fichier local d'Elementor quand il existe (doublon retiré) ; styles de Captcha by BestWebSoft et Dashicons non chargés sur les pages publiques ; hors des pages d'événement, blocs JSON-LD `Event` de Modern Events Calendar retirés (le mini-calendrier de la barre latérale en écrit un par jour d'événement, avec une description qui recopie le contenu de la page). Les pages d'événement les gardent : `wp_evenements` y lit les dates.
+  - `wpcode-snippet-referencement.php` : balise meta description à partir de l'extrait manuel (écrit avec `wp_extraits_preparer`), sauf si une extension SEO est active ; textes restés en anglais traduits par `gettext` (formulaire de recherche, « read more », libellés « Expired! » / « Ongoing... » de Modern Events Calendar) ; ni nom ni avatar d'auteur, ni date ni partage dans les résultats de recherche ; page 404 et « You May Also Like » en français ; tableaux TablePress défilables horizontalement sur mobile.
 
 ## Pages Elementor
 
@@ -148,6 +148,10 @@ Une page Elementor stocke sa mise en page dans la méta `_elementor_data` (JSON)
 - Événements Modern Events Calendar en écriture (dates hors API REST : nécessite une route côté site).
 - Version PHP et tests « directs » de Santé du site (route côté site).
 - Déploiement distant.
+
+## Erreurs réseau
+
+Délai dépassé (`delai_depasse`), site injoignable (`site_injoignable`) et erreurs 5xx sont traduits en `WordPressError` avec un message explicite : sans cela, Claude Desktop n'affiche que « Error executing tool ». Quand l'hébergement mutualisé sature, une image statique répond elle aussi lentement : c'est le signe que le problème vient du serveur et non de WordPress.
 
 ## Développement
 

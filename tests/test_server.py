@@ -40,8 +40,8 @@ async def test_statut_authenticated():
 @respx.mock
 async def test_statut_connection_failure():
     respx.get(f"{BASE}/wp-json/").mock(side_effect=httpx.ConnectError("boom"))
-    with pytest.raises(httpx.ConnectError):
-        await S.wp_statut()
+    out = await S.wp_statut()  # erreur réseau traduite : wp_statut la rapporte au lieu d'échouer
+    assert out["connexion"].startswith("échec : site injoignable")
 
 
 @respx.mock
