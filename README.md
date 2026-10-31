@@ -166,6 +166,13 @@ Délai dépassé (`delai_depasse`), site injoignable (`site_injoignable`) et err
 
 - `outils/illustrations_agenda.py evenements.json sortie/` : illustrations PNG colorées pour l'agenda (voir l'en-tête du fichier ; pictogrammes `@tabler/icons` via npm, rendu par Playwright/Chromium).
 
+## Skills
+
+Le dossier `skills/` contient deux skills génériques pour Claude, à copier dans ses propres skills et à adapter au site :
+
+- `maintenance-connecteur-wordpress` : faire évoluer, tester et dépanner le connecteur (authentification, snippets WPCode, garde-fous, ajout d'une écriture) ;
+- `usage-site-wordpress` : consulter, auditer et mettre à jour un site avec le connecteur (aperçu puis confirmation pour toute écriture).
+
 ## Développement
 
 Conventions identiques aux autres connecteurs de l'auteur : outils en français, tests hors ligne (`respx`) pour chaque garde-fou, aucune donnée réelle dans le dépôt, commit uniquement après validation en réel.
