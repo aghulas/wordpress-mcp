@@ -1,5 +1,5 @@
 ---
-name: maintenance-connecteur-wordpress
+name: maintenance-wordpress-mcp
 description: Faire évoluer, tester ou dépanner le connecteur MCP wordpress-mcp (authentification, snippets WPCode, outils de lecture et d'écriture, tests, publication sur GitHub, serveur MCP Elementor).
 ---
 

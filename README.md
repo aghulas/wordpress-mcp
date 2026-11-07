@@ -170,7 +170,7 @@ Délai dépassé (`delai_depasse`), site injoignable (`site_injoignable`) et err
 
 Le dossier `skills/` contient deux skills génériques pour Claude, à copier dans ses propres skills et à adapter au site :
 
-- `maintenance-connecteur-wordpress` : faire évoluer, tester et dépanner le connecteur (authentification, snippets WPCode, garde-fous, ajout d'une écriture) ;
+- `maintenance-wordpress-mcp` : faire évoluer, tester et dépanner le connecteur (authentification, snippets WPCode, garde-fous, ajout d'une écriture) ;
 - `usage-site-wordpress` : consulter, auditer et mettre à jour un site avec le connecteur (aperçu puis confirmation pour toute écriture).
 
 ## Développement

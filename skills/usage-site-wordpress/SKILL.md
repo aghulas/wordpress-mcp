@@ -8,7 +8,7 @@ description: "Consulter, auditer ou mettre à jour un site WordPress via le conn
 Le connecteur `wordpress` lit tout le site. Quand `wp_statut` indique que les écritures sont activées, il peut modifier certains contenus, **toujours en deux temps** : un outil `*_preparer` renvoie un aperçu (avant → après) et un jeton ; `wp_ecriture_confirmer` exécute, uniquement après l'accord explicite de la personne. Il ne supprime rien, sauf des fichiers de la médiathèque (avec copie locale).
 
 ## Démarrage
-1. `wp_statut` : connexion, compte, mode. Erreur `rest_not_logged_in` ou outils absents : skill `maintenance-connecteur-wordpress`. « Site injoignable » ou délai dépassé : voir « Site lent ».
+1. `wp_statut` : connexion, compte, mode. Erreur `rest_not_logged_in` ou outils absents : skill `maintenance-wordpress-mcp`. « Site injoignable » ou délai dépassé : voir « Site lent ».
 2. Choisir l'outil : retrouver un texte (`wp_recherche` puis `wp_contenu_lire`, format `texte` ou `elementor`), plan du site (`wp_arborescence`, `wp_pages_list`), articles (`wp_articles_list`), historique (`wp_revisions`), agenda (`wp_evenements`), tableaux (`wp_tableaux`), menus (`wp_menus`), fichiers (`wp_medias_list`), formulaires (`wp_formulaires_soumissions`), snippets (`wp_snippets`), santé (`wp_sante`), audit (`wp_extensions`, `wp_utilisateurs`, `wp_redirections`, `wp_reglages`).
 
 ## Règle commune pour modifier
