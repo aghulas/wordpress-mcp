@@ -71,6 +71,8 @@ ALLOWED_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/wpmcp/v1/snippets/\d+/statut$")),             # activer / désactiver un snippet
     ("POST", re.compile(r"^/wpmcp/v1/tablepress/tables/\d+/cellules$")),  # corriger des cellules TablePress
     ("DELETE", re.compile(r"^/wp/v2/media/\d+$")),                        # supprimer un média (copie locale avant)
+    ("POST", re.compile(r"^/wpmcp/v1/maintenance/extensions/maj$")),      # mettre à jour des extensions
+    ("POST", re.compile(r"^/wpmcp/v1/maintenance/extensions/supprimer$")),# supprimer une extension inactive
 )
 
 
@@ -160,7 +162,7 @@ class WordPressClient:
             base_url=self.settings.base_url,
             timeout=self.settings.timeout,
             auth=auth,
-            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.11.2",
+            headers={"Accept": "application/json", "User-Agent": "wordpress-mcp/0.12.0",
                      **extra_headers},
             follow_redirects=True,
         )
@@ -319,7 +321,7 @@ class WordPressClient:
         """Octets d'un fichier public du MÊME site (GET, sans identifiants) : copie de sauvegarde d'un média."""
         self._check_same_site(url)
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.11.2"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.12.0"}) as http:
             try:
                 resp = await http.get(url)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -340,7 +342,7 @@ class WordPressClient:
         if parts.scheme not in ("http", "https") or (parts.hostname or "").removeprefix("www.") != want:
             raise WordPressError(f"page publique refusée (autre domaine) : {parts.hostname}", code="domaine_refuse")
         async with httpx.AsyncClient(timeout=self.settings.timeout, follow_redirects=True,
-                                     headers={"User-Agent": "wordpress-mcp/0.11.2"}) as http:
+                                     headers={"User-Agent": "wordpress-mcp/0.12.0"}) as http:
             try:
                 resp = await http.get(url)
             except (httpx.TimeoutException, httpx.TransportError) as exc:

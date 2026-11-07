@@ -1589,6 +1589,166 @@ async def _exec_tableau_cellules(client: WordPressClient, gate: WriteGate, p: Pe
             "a_faire": "vérifier la page qui affiche le tableau (TablePress vide le cache de page)"}
 
 
+# ======================================================================= extensions maintenance
+@mcp.tool()
+async def wp_extensions_maj_preparer(extensions: list[str] | None = None) -> dict[str, Any]:
+    """PRÉPARE la mise à jour d'extensions WordPress depuis wordpress.org ; n'écrit rien.
+    `extensions` : liste facultative d'identifiants ou de noms d'extensions à mettre à jour
+    (ex. ["captcha-bws/captcha-bws", "elementor/elementor"]).
+    Si omis ou vide, prépare la mise à jour de TOUTES les extensions ayant une mise à jour disponible.
+    Aperçu = liste des extensions avec versions actuelle et cible.
+    Nécessite le snippet « MCP Maintenance des extensions » actif sur le site."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+
+    from .server import wp_sante
+    sante = await wp_sante()
+    all_ext = sante.get("versions", {}).get("extensions", [])
+    candidates = [e for e in all_ext if e.get("mise_a_jour") is True]
+
+    targets = []
+    if extensions:
+        for req in extensions:
+            req_clean = req.strip()
+            found = None
+            for e in all_ext:
+                eid = e.get("id", "")
+                if eid == req_clean or eid.split("/")[0] == req_clean or e.get("nom", "").lower() == req_clean.lower():
+                    found = e
+                    break
+            if not found:
+                raise WordPressError(f"extension introuvable : « {req} »", code="extension_introuvable")
+            if not found.get("mise_a_jour"):
+                raise WordPressError(f"l'extension « {found['nom']} » est déjà à jour ({found.get('version')})",
+                                     code="deja_a_jour")
+            targets.append(found)
+    else:
+        targets = candidates
+
+    if not targets:
+        raise WordPressError("aucune extension avec mise à jour disponible", code="aucune_maj")
+
+    preview_items = [{
+        "id": t["id"],
+        "nom": t.get("nom"),
+        "version_actuelle": t.get("version"),
+        "version_cible": t.get("derniere"),
+        "source": t.get("source"),
+    } for t in targets]
+
+    fichiers = [t["id"] + ".php" if "/" in t["id"] and not t["id"].endswith(".php") else t["id"] for t in targets]
+
+    warnings = [
+        f"Mise à jour de {len(targets)} extension(s) vers leur dernière version disponible.",
+        "Le cache de page WP Super Cache sera automatiquement vidé à la fin.",
+        "Vérifier le bon fonctionnement du site après la mise à jour."
+    ]
+
+    guard = {"extensions": [t["id"] for t in targets], "versions": {t["id"]: t.get("version") for t in targets}}
+
+    return gate.prepare(
+        "extensions_maj",
+        {"fichiers": fichiers, "cibles": preview_items},
+        summary=f"Mettre à jour {len(targets)} extension(s) ({', '.join(t['nom'] for t in targets)})",
+        preview={"extensions": preview_items, "nombre": len(targets)},
+        guard=guard,
+        warnings=warnings,
+    )
+
+
+async def _exec_extensions_maj(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    fichiers = p.args["fichiers"]
+    try:
+        res = await client.write("POST", "/wpmcp/v1/maintenance/extensions/maj", json={"extensions": fichiers})
+    except WordPressError as e:
+        if e.status == 404 or e.code == "rest_no_route":
+            raise WordPressError("le snippet « MCP Maintenance des extensions » n'est pas actif sur le site "
+                                 "(l'installer avec wp_snippet_installer_preparer)", code="snippet_manquant") from e
+        raise
+    gate.journal("extensions_maj", True, extensions=fichiers)
+    return {
+        "mises_a_jour": res.get("mises_a_jour", []),
+        "messages": res.get("messages", []),
+        "a_faire": "vérifier les pages principales du site (le cache de page a été vidé)"
+    }
+
+
+@mcp.tool()
+async def wp_extension_supprimer_preparer(extension: str) -> dict[str, Any]:
+    """PRÉPARE la suppression DÉFINITIVE des fichiers d'une extension INACTIVE ; n'écrit rien.
+    `extension` : identifiant ou nom de l'extension (ex. "royal-elementor-addons/wpr-addons" ou "Royal Elementor Addons").
+    Refusé si l'extension est active. Nécessite le snippet « MCP Maintenance des extensions » actif sur le site."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+    client = _get_client()
+
+    from .server import wp_extensions
+    ext_data = await wp_extensions()
+    all_ext = ext_data.get("extensions", [])
+
+    target = None
+    ext_clean = (extension or "").strip()
+    if not ext_clean:
+        raise WordPressError("l'identifiant ou le nom de l'extension est obligatoire", code="parametre")
+
+    for e in all_ext:
+        eid = e.get("id", "")
+        if eid == ext_clean or eid.split("/")[0] == ext_clean or e.get("nom", "").lower() == ext_clean.lower():
+            target = e
+            break
+
+    if not target:
+        raise WordPressError(f"extension introuvable : « {extension} »", code="extension_introuvable")
+
+    if target.get("statut") == "active":
+        raise WordPressError(f"l'extension « {target['nom']} » est active : désactivez-la d'abord avant de la supprimer",
+                             code="extension_active")
+
+    preview = {
+        "operation": "suppression définitive",
+        "id": target["id"],
+        "nom": target.get("nom"),
+        "version": target.get("version"),
+        "statut": target.get("statut"),
+    }
+
+    warnings = [
+        f"SUPPRESSION DÉFINITIVE des fichiers de l'extension « {target['nom']} » ({target['id']}) sur le serveur.",
+        "Cette opération est irréversible (sauf réinstallation ultérieure).",
+        "Confirmer uniquement si vous êtes certain de vouloir retirer définitivement cette extension."
+    ]
+
+    guard = {"id": target["id"], "statut": target.get("statut")}
+
+    return gate.prepare(
+        "extension_supprimer",
+        {"id": target["id"], "nom": target.get("nom")},
+        summary=f"Supprimer définitivement l'extension inactive « {target['nom']} » ({target['id']})",
+        preview=preview,
+        guard=guard,
+        warnings=warnings,
+    )
+
+
+async def _exec_extension_supprimer(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    target_id = p.args["id"]
+    try:
+        res = await client.write("POST", "/wpmcp/v1/maintenance/extensions/supprimer", json={"extension": target_id})
+    except WordPressError as e:
+        if e.status == 404 or e.code == "rest_no_route":
+            raise WordPressError("le snippet « MCP Maintenance des extensions » n'est pas actif sur le site "
+                                 "(l'installer avec wp_snippet_installer_preparer)", code="snippet_manquant") from e
+        raise
+    gate.journal("extension_supprimer", True, extension=target_id)
+    return {
+        "supprime": True,
+        "extension": target_id,
+        "nom": p.args["nom"],
+        "a_faire": "l'extension a été supprimée des fichiers du serveur"
+    }
+
+
 EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaitable[dict[str, Any]]]] = {
     "article": _exec_article,
     "widget_texte": _exec_widget_texte,
@@ -1608,6 +1768,8 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "extraits": _exec_extraits,
     "tableau_cellules": _exec_tableau_cellules,
     "medias_supprimer": _exec_medias_supprimer,
+    "extensions_maj": _exec_extensions_maj,
+    "extension_supprimer": _exec_extension_supprimer,
 }
 
 

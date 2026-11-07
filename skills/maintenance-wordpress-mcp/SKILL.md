@@ -43,7 +43,7 @@ Connecteur MCP pour un site WordPress (Elementor V3, Modern Events Calendar Lite
 
 ## Limites connues
 - MEC Lite : pas de dates en REST ; `wp_evenements` lit le JSON-LD `Event` de la page publique de chaque événement (même domaine, sans identifiants).
-- Forminator : pas de lecture des réponses en REST, d'où un snippet. TablePress et WPCode : pas d'API REST, d'où des snippets.
+- Forminator : pas de lecture des réponses en REST, d'où un snippet. TablePress et WPCode : pas d'API REST, d'où des snippets. Maintenance des extensions (mises à jour depuis wordpress.org et suppression d'extensions inactives) : passe par un snippet (`docs/wpcode-snippet-maintenance.php`).
 - Elementor V3 : écriture de `_elementor_data` par REST (JSON conservé à l'identique) ; le serveur MCP d'Elementor (`/wp-json/elementor/mcp/`) ne modifie que des éléments V4 ; ses espaces de noms (`mcp`, `elementor-mcp-composer`) restent hors des listes blanches.
 
 ## Sécurité

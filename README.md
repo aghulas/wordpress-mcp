@@ -77,7 +77,7 @@ Variables d'environnement :
 | `wp_utilisateurs` | comptes et rôles | admin | ✔ |
 | `wp_sante` | tests de santé WordPress, taille des dossiers et de la base, versions installées comparées à wordpress.org | admin | ✔ |
 
-## Outils d'écriture (21, avec `WP_ENABLE_WRITES=1`)
+## Outils d'écriture (23, avec `WP_ENABLE_WRITES=1`)
 
 | Outil | Rôle |
 |---|---|
@@ -99,6 +99,8 @@ Variables d'environnement :
 | `wp_snippet_activer_preparer` | activer (WPCode teste le code et refuse s'il est en erreur) ou désactiver un snippet ; « MCP Gestion des snippets » et « MCP Auth » ne peuvent pas être désactivés à distance |
 | `wp_tableau_cellules_preparer` | corriger des cellules existantes d'un tableau TablePress : `[{ligne, colonne, remplacer, nouveau}]` (seul l'extrait `remplacer` change, il doit figurer une seule fois) ou cellule entière ; ni ajout ni suppression de ligne, de colonne ou de tableau ; scripts refusés ; sauvegarde locale du tableau, empreinte vérifiée côté site, relecture. TablePress vide lui-même le cache des pages |
 | `wp_medias_supprimer_preparer` | supprimer **définitivement** de 1 à 50 fichiers de la médiathèque (WordPress n'a pas de corbeille pour les médias) : refusé si un fichier est l'image à la une d'un article, d'une page ou d'un événement ; l'aperçu signale les contenus qui citent encore le nom du fichier ; à la confirmation, chaque fichier est d'abord copié dans `WP_BACKUP_DIR/medias/`, puis supprimé avec ses miniatures (`DELETE …?force=true`) ; motif consigné dans le journal |
+| `wp_extensions_maj_preparer` | mettre à jour des extensions WordPress depuis wordpress.org (toutes ou sélection) ; aperçu des versions actuelle et cible ; vidage automatique du cache (avec `docs/wpcode-snippet-maintenance.php`) |
+| `wp_extension_supprimer_preparer` | supprimer **définitivement** les fichiers d'une extension **inactive** sur le serveur ; refusé si l'extension est active (avec `docs/wpcode-snippet-maintenance.php`) |
 | `wp_ecriture_confirmer` | exécuter une écriture préparée, après accord explicite de l'utilisateur |
 | `wp_ecriture_annuler` / `wp_ecritures_en_attente` | abandonner une écriture préparée / lister celles en attente |
 

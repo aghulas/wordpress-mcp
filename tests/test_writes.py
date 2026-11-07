@@ -1060,3 +1060,54 @@ async def test_medias_supprimer_refusals(writes_on):
         await WT.wp_medias_supprimer_preparer([9, 9])
     with pytest.raises(WordPressError):
         await WT.wp_medias_supprimer_preparer([999])
+
+
+@respx.mock
+async def test_extensions_maj_prepare_confirm(writes_on):
+    import re
+    respx.get(f"{BASE}/feed/").mock(return_value=httpx.Response(200, text="<rss></rss>"))
+    respx.get(f"{BASE}/wp-json/wp/v2/plugins").mock(return_value=httpx.Response(200, json=[
+        {"plugin": "captcha-bws/captcha-bws", "name": "Captcha", "version": "5.2.9", "status": "active"},
+    ]))
+    respx.get(f"{BASE}/wp-json/wp/v2/themes").mock(return_value=httpx.Response(200, json=[]))
+    for name in S.HEALTH_TESTS:
+        respx.get(f"{BASE}/wp-json/wp-site-health/v1/tests/{name}").mock(return_value=httpx.Response(200, json={"status": "good", "label": name}))
+    respx.get(f"{BASE}/wp-json/wp-site-health/v1/directory-sizes").mock(return_value=httpx.Response(200, json={}))
+    respx.get(re.compile(r"^https://api\.wordpress\.org/core/.*")).mock(return_value=httpx.Response(200, json={"offers": []}))
+    respx.get(re.compile(r"^https://api\.wordpress\.org/plugins/.*")).mock(return_value=httpx.Response(200, json={"version": "5.3.1"}))
+    respx.post(f"{BASE}/wp-json/wpmcp/v1/maintenance/extensions/maj").mock(return_value=httpx.Response(200, json={
+        "succes": True, "mises_a_jour": [{"fichier": "captcha-bws/captcha-bws.php", "nom": "Captcha", "succes": True, "version": "5.3.1"}],
+        "messages": ["Mise à jour réussie"]
+    }))
+
+    prep = await WT.wp_extensions_maj_preparer(["captcha-bws"])
+    assert prep["apercu"]["nombre"] == 1
+    assert prep["apercu"]["extensions"][0]["version_cible"] == "5.3.1"
+    res = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert res["mises_a_jour"][0]["succes"] is True
+    assert res["mises_a_jour"][0]["version"] == "5.3.1"
+
+
+@respx.mock
+async def test_extension_supprimer_prepare_confirm(writes_on):
+    import re
+    respx.get(f"{BASE}/wp-json/wp/v2/plugins").mock(return_value=httpx.Response(200, json=[
+        {"plugin": "elementor/elementor", "name": "Elementor", "version": "4.3.5", "status": "active"},
+        {"plugin": "royal-elementor-addons/wpr-addons", "name": "Royal Elementor Addons", "version": "1.7.1070", "status": "inactive"},
+    ]))
+    respx.get(re.compile(rf"^{BASE}/wp-json/wp/v2/themes.*")).mock(return_value=httpx.Response(200, json=[]))
+    # Refuse active
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_extension_supprimer_preparer("Elementor")
+    assert e.value.code == "extension_active"
+
+    # Allow inactive
+    respx.post(f"{BASE}/wp-json/wpmcp/v1/maintenance/extensions/supprimer").mock(return_value=httpx.Response(200, json={
+        "succes": True, "supprime": True, "fichier": "royal-elementor-addons/wpr-addons.php", "nom": "Royal Elementor Addons"
+    }))
+    prep = await WT.wp_extension_supprimer_preparer("royal-elementor-addons")
+    assert prep["apercu"]["operation"] == "suppression définitive"
+    res = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert res["supprime"] is True
+    assert res["nom"] == "Royal Elementor Addons"
+
