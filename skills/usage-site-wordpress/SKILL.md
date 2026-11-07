@@ -1,6 +1,6 @@
 ---
-name: usage-site-wordpress
-description: Consulter, auditer ou mettre à jour un site WordPress via le connecteur wordpress-mcp (pages, widgets Elementor, tableaux, menus, médias, redirections, agenda), écritures avec aperçu et confirmation.
+name: "usage-site-wordpress"
+description: "Consulter, auditer ou mettre à jour un site WordPress via le connecteur wordpress-mcp (pages, widgets Elementor, tableaux, menus, médias, redirections, agenda), écritures avec aperçu et confirmation."
 ---
 
 # Utiliser le connecteur WordPress
