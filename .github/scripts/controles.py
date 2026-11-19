@@ -27,7 +27,7 @@ from pathlib import Path
 RACINE = Path.cwd()
 NOM = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 SECRETS = {
-    "clé privée": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    "clé privée": re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:\\n|\s)*[A-Za-z0-9+/]{40}"),
     "jeton GitHub": re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{60,}\b"),
     "clé AWS": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     "jeton Slack": re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{20,}\b"),
