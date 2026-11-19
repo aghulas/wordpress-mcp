@@ -7,6 +7,18 @@ description: Faire évoluer, tester ou dépanner le connecteur MCP wordpress-mcp
 
 Connecteur MCP pour un site WordPress (Elementor V3, Modern Events Calendar Lite, Redirection, Forminator, WPCode, TablePress). Lecture par défaut ; écritures seulement si `WP_ENABLE_WRITES=1`, toujours en deux temps (aperçu puis confirmation). Le dépôt est générique : aucun identifiant de site, de personne ou d'organisation dans le code, les tests, `docs/` ou `outils/`.
 
+## Branches, CI et fusion (à lire d'abord)
+
+Plusieurs sessions travaillent sur ce dépôt : suivre `CLAUDE.md` à la racine du dépôt.
+
+- Ne rien modifier dans `~/dev/wordpress-mcp` ni sur la branche principale : une tâche = une branche `claude/<sujet>` dans son
+  propre dossier (`git worktree`).
+- Travail prêt : push de la branche puis pull request. Le CI GitHub (tests, skills, secrets) la fusionne s'il est vert,
+  puis les marketplaces sont régénérées et poussées automatiquement.
+- Ne pas lancer `generer_catalogues.py --ecrire`, ne rien pousser dans un dépôt `*-marketplace`, ne pas proposer de carte
+  de skill.
+- Là où cette skill dit « commit, push », lire : commit sur la branche, push de la branche, pull request.
+
 ## Méthode de travail
 - Si l'environnement d'exécution ne peut pas joindre le site (proxy, pas de réseau), coder et tester hors ligne (`pytest`, `respx`, site fictif `https://wp.test`), puis lancer les tests et la validation réelle sur la machine de l'utilisateur, avec le venv du projet (`./.venv/bin/python`).
 - Scripts de validation réelle : les ranger **hors du dépôt**. Un petit module charge les variables de l'entrée `wordpress` du fichier de configuration de Claude Desktop dans `os.environ`, puis le script appelle `server` / `write_tools` (`asyncio.run`, ou `mcp.call_tool(nom, arguments)` pour voir ce que reçoit le modèle). Ne jamais afficher les mots de passe.
