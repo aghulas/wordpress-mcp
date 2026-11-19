@@ -1,0 +1,95 @@
+# Déployé par l'outil deployer_ci.py du dépôt agrégateur — modifier le modèle, pas ce fichier.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements*.txt
+      - name: Installer
+        run: |
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[dev]"
+          else
+            pip install -r requirements.txt pytest
+          fi
+      - name: Tests
+        run: python -m pytest -q tests
+
+  controles:
+    name: Skills et secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/scripts/controles.py
+
+  fusion:
+    name: Fusion automatique
+    # Une pull request ouverte (pas en brouillon) depuis une branche du dépôt = travail prêt :
+    # elle est fusionnée dès que les tests et les contrôles passent.
+    needs: [tests, controles]
+    if: >-
+      github.event_name == 'pull_request'
+      && !github.event.pull_request.draft
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    concurrency:
+      group: fusion-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      BASE: ${{ github.event.pull_request.base.ref }}
+      MARKETPLACES_TOKEN: ${{ secrets.MARKETPLACES_TOKEN }}
+      MARKETPLACES_REPO: ${{ vars.MARKETPLACES_REPO }}
+    steps:
+      - name: Fusionner la pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --merge --delete-branch
+      - name: Lancer les autres workflows du dépôt (déploiement)
+        # Une fusion faite par le jeton intégré ne déclenche pas les workflows « on: push » : on les lance ici.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active") | .path' | while read -r chemin; do
+            [ "$chemin" = ".github/workflows/ci.yml" ] && continue
+            case "$chemin" in .github/workflows/*) ;; *) continue ;; esac
+            if gh workflow run "$(basename "$chemin")" --repo "$GITHUB_REPOSITORY" --ref "$BASE"; then
+              echo "::notice::lancé : $chemin sur $BASE"
+            else
+              echo "::warning::$chemin non lancé (pas de déclencheur workflow_dispatch ?)"
+            fi
+          done
+      - name: Demander la régénération des marketplaces
+        if: env.MARKETPLACES_TOKEN != '' && env.MARKETPLACES_REPO != ''
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACES_TOKEN }}
+        run: gh workflow run marketplaces.yml --repo "$MARKETPLACES_REPO"
+      - name: Régénération différée
+        if: env.MARKETPLACES_TOKEN == '' || env.MARKETPLACES_REPO == ''
+        run: echo "::notice::MARKETPLACES_TOKEN ou MARKETPLACES_REPO absent — les marketplaces seront régénérées au prochain passage planifié."
