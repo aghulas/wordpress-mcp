@@ -1749,6 +1749,91 @@ async def _exec_extension_supprimer(client: WordPressClient, gate: WriteGate, p:
     }
 
 
+@mcp.tool()
+async def wp_extension_activer_preparer(extension: str, actif: bool = True) -> dict[str, Any]:
+    """PRÉPARE l'activation ou la désactivation d'une extension WordPress ; n'écrit rien.
+    `extension` : identifiant ou nom de l'extension (ex. "hide-admin-menu/hide-admin-menu" ou "Hide Admin Menu").
+    `actif` : True pour activer, False pour désactiver.
+    Nécessite le snippet « MCP Maintenance des extensions » actif sur le site."""
+    gate = _get_gate()
+    gate.ensure_enabled()
+
+    from .server import wp_extensions
+    ext_data = await wp_extensions()
+    all_ext = ext_data.get("extensions", [])
+
+    ext_clean = (extension or "").strip()
+    if not ext_clean:
+        raise WordPressError("l'identifiant ou le nom de l'extension est obligatoire", code="parametre")
+
+    target = None
+    for e in all_ext:
+        eid = e.get("id", "")
+        if eid == ext_clean or eid.split("/")[0] == ext_clean or e.get("nom", "").lower() == ext_clean.lower():
+            target = e
+            break
+
+    if not target:
+        raise WordPressError(f"extension introuvable : « {extension} »", code="extension_introuvable")
+
+    cible_statut = "active" if actif else "inactive"
+    if target.get("statut") == cible_statut:
+        raise WordPressError(
+            f"l'extension « {target['nom']} » est déjà {'active' if actif else 'inactive'}",
+            code="deja_dans_cet_etat",
+        )
+
+    if not actif and target["id"].startswith("insert-headers-and-footers/"):
+        raise WordPressError(
+            "impossible de désactiver WPCode à distance : cela couperait les snippets MCP",
+            code="extension_protegee",
+        )
+
+    action_label = "activation" if actif else "désactivation"
+    preview = {
+        "operation": action_label,
+        "id": target["id"],
+        "nom": target.get("nom"),
+        "version": target.get("version"),
+        "statut_actuel": target.get("statut"),
+        "statut_cible": cible_statut,
+    }
+    warnings = [
+        f"{'Activation' if actif else 'Désactivation'} immédiate de l'extension « {target['nom']} » ({target['id']}).",
+        "Le cache de page WP Super Cache sera automatiquement vidé à la fin.",
+    ]
+    guard = {"id": target["id"], "statut": target.get("statut")}
+
+    return gate.prepare(
+        "extension_statut",
+        {"id": target["id"], "nom": target.get("nom"), "actif": actif},
+        summary=f"{'Activer' if actif else 'Désactiver'} l'extension « {target['nom']} » ({target['id']})",
+        preview=preview,
+        guard=guard,
+        warnings=warnings,
+    )
+
+
+async def _exec_extension_statut(client: WordPressClient, gate: WriteGate, p: PendingWrite) -> dict[str, Any]:
+    target_id = p.args["id"]
+    actif = p.args["actif"]
+    try:
+        res = await client.write("POST", "/wpmcp/v1/maintenance/extensions/statut",
+                                 json={"extension": target_id, "actif": actif})
+    except WordPressError as e:
+        if e.status == 404 or e.code == "rest_no_route":
+            raise WordPressError("le snippet « MCP Maintenance des extensions » n'est pas actif ou à jour sur le site "
+                                 "(l'installer avec wp_snippet_installer_preparer)", code="snippet_manquant") from e
+        raise
+    gate.journal("extension_statut", True, extension=target_id, actif=actif)
+    return {
+        "extension": target_id,
+        "nom": res.get("nom") or p.args["nom"],
+        "actif": res.get("actif", actif),
+        "a_faire": "vérifier les pages principales du site (le cache de page a été vidé)",
+    }
+
+
 EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaitable[dict[str, Any]]]] = {
     "article": _exec_article,
     "widget_texte": _exec_widget_texte,
@@ -1770,6 +1855,7 @@ EXECUTORS: dict[str, Callable[[WordPressClient, WriteGate, PendingWrite], Awaita
     "medias_supprimer": _exec_medias_supprimer,
     "extensions_maj": _exec_extensions_maj,
     "extension_supprimer": _exec_extension_supprimer,
+    "extension_statut": _exec_extension_statut,
 }
 
 

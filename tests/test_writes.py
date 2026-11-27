@@ -1066,6 +1066,8 @@ async def test_medias_supprimer_refusals(writes_on):
 async def test_extensions_maj_prepare_confirm(writes_on):
     import re
     respx.get(f"{BASE}/feed/").mock(return_value=httpx.Response(200, text="<rss></rss>"))
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/maintenance/mises-a-jour").mock(
+        return_value=httpx.Response(404, json={"code": "rest_no_route", "message": "Absent"}))
     respx.get(f"{BASE}/wp-json/wp/v2/plugins").mock(return_value=httpx.Response(200, json=[
         {"plugin": "captcha-bws/captcha-bws", "name": "Captcha", "version": "5.2.9", "status": "active"},
     ]))
@@ -1110,4 +1112,35 @@ async def test_extension_supprimer_prepare_confirm(writes_on):
     res = await WT.wp_ecriture_confirmer(prep["jeton"])
     assert res["supprime"] is True
     assert res["nom"] == "Royal Elementor Addons"
+
+
+@respx.mock
+async def test_extension_activer_prepare_confirm(writes_on):
+    import re
+    respx.get(f"{BASE}/wp-json/wp/v2/plugins").mock(return_value=httpx.Response(200, json=[
+        {"plugin": "hide-admin-menu/hide-admin-menu", "name": "Hide Admin Menu", "version": "1.2.0", "status": "inactive"},
+        {"plugin": "insert-headers-and-footers/ihaf", "name": "WPCode Lite", "version": "2.4.2", "status": "active"},
+    ]))
+    respx.get(re.compile(rf"^{BASE}/wp-json/wp/v2/themes.*")).mock(return_value=httpx.Response(200, json=[]))
+
+    # Refuse déjà inactive
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_extension_activer_preparer("Hide Admin Menu", actif=False)
+    assert e.value.code == "deja_dans_cet_etat"
+
+    # Refuse désactivation WPCode
+    with pytest.raises(WordPressError) as e:
+        await WT.wp_extension_activer_preparer("WPCode Lite", actif=False)
+    assert e.value.code == "extension_protegee"
+
+    # Activation réussie
+    respx.post(f"{BASE}/wp-json/wpmcp/v1/maintenance/extensions/statut").mock(return_value=httpx.Response(200, json={
+        "succes": True, "fichier": "hide-admin-menu/hide-admin-menu.php", "nom": "Hide Admin Menu", "actif": True
+    }))
+    prep = await WT.wp_extension_activer_preparer("hide-admin-menu", actif=True)
+    assert prep["apercu"]["operation"] == "activation"
+    assert prep["apercu"]["statut_cible"] == "active"
+    res = await WT.wp_ecriture_confirmer(prep["jeton"])
+    assert res["actif"] is True
+    assert res["nom"] == "Hide Admin Menu"
 
