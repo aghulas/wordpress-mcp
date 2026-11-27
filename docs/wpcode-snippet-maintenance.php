@@ -2,8 +2,16 @@
 /**
  * Snippet WPCode — « MCP Maintenance des extensions »
  *
- * Ce code ajoute deux routes réservées aux administrateurs autorisés à gérer les extensions
- * (manage_options + update_plugins / delete_plugins) :
+ * Ce code ajoute des routes réservées aux administrateurs autorisés à gérer les extensions
+ * (manage_options + activate_plugins / update_plugins / delete_plugins) :
+ *
+ *   GET  /wp-json/wpmcp/v1/maintenance/mises-a-jour (?rafraichir=1)
+ *        lit la version installée du cœur WordPress et les mises à jour disponibles dans les
+ *        transients WordPress (cœur, extensions y compris commerciales, thèmes).
+ *
+ *   POST /wp-json/wpmcp/v1/maintenance/extensions/statut
+ *        corps JSON : { "extension": "hide-admin-menu/hide-admin-menu.php", "actif": true }
+ *        active ou désactive une extension via activate_plugin() / deactivate_plugins().
  *
  *   POST /wp-json/wpmcp/v1/maintenance/extensions/maj
  *        corps JSON : { "extensions": [ "captcha-bws/captcha-bws.php", ... ] }
@@ -198,6 +206,142 @@ add_action( 'rest_api_init', function () {
 				'supprime'  => true,
 				'fichier'   => $plugin_file,
 				'nom'       => $nom,
+			) );
+		},
+		'permission_callback' => $allowed,
+	) );
+
+	register_rest_route( 'wpmcp/v1', '/maintenance/extensions/statut', array(
+		'methods'             => 'POST',
+		'callback'            => function ( WP_REST_Request $request ) {
+			if ( ! current_user_can( 'activate_plugins' ) && ! current_user_can( 'manage_options' ) ) {
+				return new WP_Error( 'rest_forbidden', 'Droits insuffisants pour activer ou désactiver des extensions.', array( 'status' => 403 ) );
+			}
+
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+			$params = $request->get_json_params();
+			$target = isset( $params['extension'] ) ? sanitize_text_field( $params['extension'] ) : '';
+			$actif  = isset( $params['actif'] ) ? $params['actif'] : null;
+
+			if ( empty( $target ) || ! is_bool( $actif ) ) {
+				return new WP_Error( 'parametre_invalide', 'Les paramètres « extension » et « actif » (booléen) sont obligatoires.', array( 'status' => 400 ) );
+			}
+
+			$installed   = get_plugins();
+			$plugin_file = null;
+			if ( isset( $installed[ $target ] ) ) {
+				$plugin_file = $target;
+			} elseif ( isset( $installed[ $target . '.php' ] ) ) {
+				$plugin_file = $target . '.php';
+			} else {
+				foreach ( array_keys( $installed ) as $inst_file ) {
+					if ( $inst_file === $target || $inst_file === $target . '.php' || dirname( $inst_file ) === $target || strpos( $inst_file, $target . '/' ) === 0 ) {
+						$plugin_file = $inst_file;
+						break;
+					}
+				}
+			}
+
+			if ( ! $plugin_file ) {
+				return new WP_Error( 'extension_introuvable', 'Extension introuvable sur le site : ' . $target, array( 'status' => 404 ) );
+			}
+
+			if ( ! $actif && 0 === strpos( $plugin_file, 'insert-headers-and-footers/' ) ) {
+				return new WP_Error( 'extension_protegee', 'Impossible de désactiver WPCode à distance : cela couperait les snippets MCP.', array( 'status' => 403 ) );
+			}
+
+			$nom = isset( $installed[ $plugin_file ]['Name'] ) ? $installed[ $plugin_file ]['Name'] : $plugin_file;
+
+			if ( $actif ) {
+				if ( ! is_plugin_active( $plugin_file ) ) {
+					$res = activate_plugin( $plugin_file );
+					if ( is_wp_error( $res ) ) {
+						return $res;
+					}
+				}
+			} else {
+				if ( is_plugin_active( $plugin_file ) ) {
+					deactivate_plugins( array( $plugin_file ) );
+				}
+			}
+
+			// Vider le cache de page
+			if ( function_exists( 'wp_cache_clean_cache' ) ) {
+				global $file_prefix;
+				wp_cache_clean_cache( $file_prefix, true );
+			}
+
+			return rest_ensure_response( array(
+				'succes'  => true,
+				'fichier' => $plugin_file,
+				'nom'     => $nom,
+				'actif'   => is_plugin_active( $plugin_file ),
+			) );
+		},
+		'permission_callback' => $allowed,
+	) );
+
+	register_rest_route( 'wpmcp/v1', '/maintenance/mises-a-jour', array(
+		'methods'             => 'GET',
+		'callback'            => function ( WP_REST_Request $request ) {
+			require_once ABSPATH . 'wp-admin/includes/update.php';
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+			if ( $request->get_param( 'rafraichir' ) ) {
+				wp_version_check();
+				wp_update_plugins();
+				wp_update_themes();
+			}
+
+			$core_installed = get_bloginfo( 'version' );
+			$core_updates   = get_core_updates();
+			$core_latest    = $core_installed;
+			$core_upgrade   = false;
+			if ( is_array( $core_updates ) && ! empty( $core_updates ) ) {
+				$first = $core_updates[0];
+				if ( isset( $first->current ) ) {
+					$core_latest = $first->current;
+				}
+				if ( isset( $first->response ) && 'upgrade' === $first->response ) {
+					$core_upgrade = true;
+				}
+			}
+
+			$installed_plugins = get_plugins();
+			$plugin_transient  = get_site_transient( 'update_plugins' );
+			$plugin_updates    = array();
+			if ( is_object( $plugin_transient ) && ! empty( $plugin_transient->response ) ) {
+				foreach ( $plugin_transient->response as $file => $info ) {
+					$plugin_updates[ $file ] = array(
+						'version_actuelle' => isset( $installed_plugins[ $file ]['Version'] ) ? $installed_plugins[ $file ]['Version'] : null,
+						'nouvelle_version' => isset( $info->new_version ) ? $info->new_version : null,
+						'package'          => ! empty( $info->package ),
+					);
+				}
+			}
+
+			$theme_transient = get_site_transient( 'update_themes' );
+			$theme_updates   = array();
+			if ( is_object( $theme_transient ) && ! empty( $theme_transient->response ) ) {
+				foreach ( $theme_transient->response as $slug => $info ) {
+					$theme_obj = wp_get_theme( $slug );
+					$theme_updates[ $slug ] = array(
+						'version_actuelle' => $theme_obj->exists() ? $theme_obj->get( 'Version' ) : null,
+						'nouvelle_version' => isset( $info['new_version'] ) ? $info['new_version'] : null,
+						'package'          => ! empty( $info['package'] ),
+					);
+				}
+			}
+
+			return rest_ensure_response( array(
+				'wordpress'  => array(
+					'installee'   => $core_installed,
+					'derniere'    => $core_latest,
+					'mise_a_jour' => $core_upgrade,
+				),
+				'extensions' => $plugin_updates,
+				'themes'     => $theme_updates,
 			) );
 		},
 		'permission_callback' => $allowed,

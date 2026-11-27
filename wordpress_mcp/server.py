@@ -714,6 +714,13 @@ async def _versions(client: WordPressClient) -> dict[str, Any]:
             (client.settings.base_url or "").rstrip("/") + "/feed/"))
     except WordPressError:
         pass
+    wp_updates: dict[str, Any] = {}
+    try:
+        wp_updates = await client.get("/wpmcp/v1/maintenance/mises-a-jour")
+    except WordPressError:
+        pass
+    if not installed_core and isinstance(wp_updates.get("wordpress"), dict):
+        installed_core = wp_updates["wordpress"].get("installee")
     try:
         latest = await W.WordPressOrg(timeout=client.settings.timeout).latest_versions(
             [W.plugin_slug(p.get("plugin")) or "" for p in plugins],
@@ -721,15 +728,29 @@ async def _versions(client: WordPressClient) -> dict[str, Any]:
     except Exception as e:  # wordpress.org injoignable : on donne au moins les versions installées
         latest = {"core": None, "plugins": {}, "themes": {}}
         out["note"] = f"wordpress.org injoignable ({type(e).__name__}) : dernières versions inconnues"
+    if not latest["core"] and isinstance(wp_updates.get("wordpress"), dict):
+        latest["core"] = wp_updates["wordpress"].get("derniere")
     out["wordpress"] = {"installee": installed_core, "derniere": latest["core"],
                         "mise_a_jour": W.is_outdated(installed_core, latest["core"])}
+
+    ext_transients = wp_updates.get("extensions") if isinstance(wp_updates.get("extensions"), dict) else {}
+    theme_transients = wp_updates.get("themes") if isinstance(wp_updates.get("themes"), dict) else {}
+
+    def _find_transient(transients: dict[str, Any], ident: Any) -> dict[str, Any] | None:
+        if not isinstance(ident, str) or not transients:
+            return None
+        return transients.get(ident) or transients.get(f"{ident}.php")
 
     def row(kind: str, slug: str | None, ident: Any, name: Any, status: Any, version: Any) -> dict[str, Any]:
         last = latest[kind].get(slug) if slug else None
         known = bool(slug) and slug in latest[kind]
+        source = "wordpress.org" if last else ("hors wordpress.org" if known else "inconnue")
+        if not last:
+            tr = _find_transient(ext_transients if kind == "plugins" else theme_transients, ident)
+            if isinstance(tr, dict) and tr.get("nouvelle_version"):
+                last = tr["nouvelle_version"]
         return {"id": ident, "nom": name, "statut": status, "version": version, "derniere": last,
-                "mise_a_jour": W.is_outdated(version, last),
-                "source": "wordpress.org" if last else ("hors wordpress.org" if known else "inconnue")}
+                "mise_a_jour": W.is_outdated(version, last), "source": source}
 
     out["extensions"] = [row("plugins", W.plugin_slug(p.get("plugin")), p.get("plugin"), p.get("name"),
                              p.get("status"), p.get("version")) for p in plugins]
@@ -741,8 +762,10 @@ async def _versions(client: WordPressClient) -> dict[str, Any]:
         [f"{i['nom']} {i['version']} → {i['derniere']}" for i in items if i["mise_a_jour"]]
     out["hors_wordpress_org"] = [i["nom"] for i in items if i["source"] == "hors wordpress.org"]
     if out["hors_wordpress_org"]:
-        out["note_hors_wordpress_org"] = ("versions des extensions et thèmes commerciaux à vérifier dans "
-                                          "wp-admin › Tableau de bord › Mises à jour")
+        out["note_hors_wordpress_org"] = (
+            "transients WordPress consultés ; les extensions sans mise à jour annoncée restent à vérifier "
+            "dans wp-admin › Tableau de bord › Mises à jour" if wp_updates else
+            "versions des extensions et thèmes commerciaux à vérifier dans wp-admin › Tableau de bord › Mises à jour")
     return out
 
 

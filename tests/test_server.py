@@ -278,7 +278,7 @@ async def test_utilisateurs_and_revisions():
 async def test_tool_count():
     tools = await S.mcp.list_tools()
     names = {t.name for t in tools}
-    assert len(tools) == 42
+    assert len(tools) == 43
     assert all(n.startswith("wp_") for n in names)
     # Écritures : uniquement des outils de préparation + confirmation, aucune suppression.
     writers = {n for n in names if n.endswith("_preparer") or n.startswith("wp_ecriture")}
@@ -288,7 +288,7 @@ async def test_tool_count():
                        "wp_page_regenerer_preparer", "wp_page_modele_preparer",
                        "wp_snippet_installer_preparer", "wp_snippet_activer_preparer", "wp_extraits_preparer",
                        "wp_tableau_cellules_preparer", "wp_medias_supprimer_preparer",
-                       "wp_extensions_maj_preparer", "wp_extension_supprimer_preparer",
+                       "wp_extensions_maj_preparer", "wp_extension_supprimer_preparer", "wp_extension_activer_preparer",
                        "wp_ecriture_confirmer", "wp_ecriture_annuler", "wp_ecritures_en_attente"}
     assert not any(k in n for n in names for k in ("delete", "upload", "create", "update"))
     assert sorted([n for n in names if "supprim" in n]) == ["wp_extension_supprimer_preparer", "wp_medias_supprimer_preparer"]
@@ -323,6 +323,8 @@ async def test_sante(monkeypatch, fake_client):
         {"stylesheet": "ashe-pro", "name": {"rendered": "Ashe Pro"}, "version": "3.9", "status": "active"}]))
     respx.get(f"{BASE}/feed/").mock(return_value=httpx.Response(
         200, text="<rss><generator>https://wordpress.org/?v=7.1.2</generator></rss>"))
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/maintenance/mises-a-jour").mock(
+        return_value=httpx.Response(404, json={"code": "rest_no_route", "message": "Absent"}))
 
     async def fake_latest(self, plugins, themes):
         assert sorted(plugins) == ["elementor", "elementor-pro"] and themes == ["ashe-pro"]
@@ -348,4 +350,33 @@ async def test_sante_sans_mises_a_jour_ni_wordpress_org(monkeypatch):
         return_value=httpx.Response(403, json={"code": "rest_forbidden", "message": "Interdit"}))
     out = await S.wp_sante(mises_a_jour=False)
     assert out["resume"] == {"bon": 6} and "versions" not in out and "erreur" in out["tailles"]
+
+
+@respx.mock
+async def test_sante_transients_mises_a_jour(monkeypatch, fake_client):
+    from wordpress_mcp import wporg as W
+    for name in S.HEALTH_TESTS:
+        respx.get(f"{BASE}/wp-json/wp-site-health/v1/tests/{name}").mock(return_value=_health("good", "OK"))
+    respx.get(f"{BASE}/wp-json/wp-site-health/v1/directory-sizes").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{BASE}/wp-json/wp/v2/plugins").mock(return_value=httpx.Response(200, json=[
+        {"plugin": "elementor-pro/elementor-pro", "name": "Elementor Pro", "version": "4.3.2", "status": "active"},
+    ]))
+    respx.get(f"{BASE}/wp-json/wp/v2/themes").mock(return_value=httpx.Response(200, json=[
+        {"stylesheet": "ashe-pro", "name": {"rendered": "Ashe Pro"}, "version": "3.9", "status": "active"},
+    ]))
+    respx.get(f"{BASE}/feed/").mock(return_value=httpx.Response(200, text="<rss></rss>"))
+    respx.get(f"{BASE}/wp-json/wpmcp/v1/maintenance/mises-a-jour").mock(return_value=httpx.Response(200, json={
+        "wordpress": {"installee": "7.1.5", "derniere": "7.1.5", "mise_a_jour": False},
+        "extensions": {"elementor-pro/elementor-pro.php": {"version_actuelle": "4.3.2", "nouvelle_version": "4.3.3", "package": True}},
+        "themes": {"ashe-pro": {"version_actuelle": "3.9", "nouvelle_version": "3.9.1", "package": True}},
+    }))
+
+    async def fake_latest(self, plugins, themes):
+        return {"core": "7.1.5", "plugins": {"elementor-pro": None}, "themes": {"ashe-pro": None}}
+    monkeypatch.setattr(W.WordPressOrg, "latest_versions", fake_latest)
+
+    out = await S.wp_sante()
+    v = out["versions"]
+    assert v["wordpress"] == {"installee": "7.1.5", "derniere": "7.1.5", "mise_a_jour": False}
+    assert v["a_mettre_a_jour"] == ["Elementor Pro 4.3.2 → 4.3.3", "Ashe Pro 3.9 → 3.9.1"]
 
